@@ -6,8 +6,10 @@ Public surface:
 
 from . import authz, crypto, drills, ed25519, evidence, policy, regions, sessions
 from . import transparency, transparency_verify
+from . import budgets, budget_verify
 from .attestation import DeviceWallet, EnrolledDevice, provision_device
 from .authz import Authz
+from .budgets import BudgetManager
 from .ceremony import Orchestrator
 from .directory import KeyDirectory
 from .drills import DrillsManager
@@ -26,10 +28,10 @@ from .storage import AuditLog, Store
 __all__ = [
     "Orchestrator", "Store", "AuditLog", "KeyDirectory",
     "DeviceWallet", "EnrolledDevice", "provision_device",
-    "SessionManager", "Authz",
+    "SessionManager", "Authz", "BudgetManager",
     "DrillsManager", "Region", "RegionRegistry",
     "authz", "sessions", "crypto", "drills", "evidence", "regions",
-    "ed25519", "policy",
+    "ed25519", "policy", "budgets", "budget_verify",
     "CeremonyError", "ConflictState", "PolicyViolation", "AttestationError",
     "AuthenticationError", "Forbidden", "ProtectedOperation",
     "DuplicateAction", "ReplayError", "QuorumFailure",

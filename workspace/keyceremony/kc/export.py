@@ -81,6 +81,15 @@ def build_bundle(orch, sessions=None, authz_mod=None) -> dict:
         "drill_evidence": list(s.get("drill_evidence", {}).values()),
         "drill_regions": dict(s.get("drill_regions", {})),
         "transparency": _transparency_section(orch),
+        "sign_budgets": {
+            "subjects": dict(s.get("sign_subjects", {})),
+            "budgets": [
+                orch.budgets.public_budget(bid)
+                for bid in sorted(s.get("sign_budgets", {}).keys())],
+            "requests": [
+                orch.budgets.request_view(rid)
+                for rid in sorted(s.get("sign_requests", {}).keys())],
+        },
     }
     body["invariants"] = {
         "body_hash_excluding_sig": crypto.digest_hex(
@@ -362,6 +371,17 @@ def verify_bundle(bundle: dict) -> dict:
     checks["transparency_leaves"] = tv["n_leaves"]
     for f in tv["findings"]:
         problems.append(f"transparency: {f['code']} {f['message']}")
+
+    # 10. verifiable signing-quota budgets: replay every quantity change
+    from .budget_verify import verify_budget_audit
+    leads = frozenset(
+        pid for pid, pr in bundle.get("participants", {}).items()
+        if pr.get("role") == "ROOT_OWNER")
+    bv = verify_budget_audit(bundle["audit"], security_leads=leads)
+    checks["sign_budgets_ok"] = bv["ok"]
+    for f in bv["findings"]:
+        problems.append(
+            f"sign budget: {f['code']} (audit seq {f['seq']}) {f['message']}")
 
     return {"ok": not problems, "problems": problems, "checks": checks}
 

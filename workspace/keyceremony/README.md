@@ -227,6 +227,75 @@ python -m kc.transparency_cli verify ./export/export.json
 
 ---
 
+## 1f. 签名入口的可核验用量预算（预算单 / 修订链 / 短租期保留 / 接管）
+
+安全负责人按**用途 + 密钥版本**签发预算单：写明**调用主体、可签总次数、单批
+上限、生效时间与截止时间、保留租期**。有预算单的用途，签名必须走
+
+```
+保留额度（唯一请求号 + 短租期 + 保留凭据）→ 产出签名（签名审计摘要）→ 保留结算为消费
+```
+
+三步各自追加一条哈希链 + 服务签名审计，并在追加后原子落盘 state.json。
+没有预算单的用途**完全按原方式签名**（`Orchestrator.sign` 行为不变）。
+
+| 需求 | 实现方式 |
+|---|---|
+| **先保留再签名、结算为消费** | `BudgetManager.hold → record_signature → settle`（`kc/budgets.py`）。全部变更在跨线程 RLock + 跨进程 flock 内「加载最新→判定→落盘」，**已结算 + 仍保留 ≤ 总量**，任何时刻可用量非负。 |
+| **唯一请求号幂等** | 相同 `request_id` 再次提交绝不产生第二个签名或第二笔消费：已结算返回第一次的签名与结算记录；签名已写但未结算的重放自动补结算；租期内无签名的并发重放报 `REQUEST_IN_FLIGHT`。 |
+| **最后额度并发争抢** | 线程池 8 路、真实进程（flock）6 路争抢总量 1：恰好 1 路成功，其余 `QUOTA_EXHAUSTED`，消费+保留恒等于总量。 |
+| **短租期 + 进程退出接管** | 保留带 `lease_expires_at` 与 HMAC 保留凭据。接管者**只依据签名审计**判定：已有签名 → 结算（额度永不可再用）；无签名且租期已过 → 安全归还；租期未到 → 保持不动。`sweep_expired` 批量处理。 |
+| **崩溃恢复不丢已 fsync 的决定** | 审计日志是权威记录：每步先 fsync 审计再 rename state.json；`BudgetManager.recover()` 从审计事件重建/推进记录，「审计已写、state 落后」的崩溃窗口被事件溯源补齐。 |
+| **修订号递增 / 乐观并发** | 修订必须带 `base_revision`；旧修订提交返回 409 `REVISION_CONFLICT`，载荷带 `base/current_revision` 与双方快照数量差异，绝不覆盖较新决定。修订号必须严格 +1。 |
+| **缩减下限** | 新总量不得小于 **已消费量 + 有效保留量**（`SHRINK_BELOW_CONSUMED_PLUS_HELD`，带 floor/双方数量）；恰好等于 floor 允许。 |
+| **四类关闭条件拒绝新保留** | 预算暂停（`BUDGET_PAUSED`）、调用主体被撤销（`SUBJECT_REVOKED`）、密钥版本退役 RETIRING/DESTROYED/ABORTED（`KEY_VERSION_RETIRED`）、时间窗未生效/已结束（`BUDGET_NOT_YET_VALID/BUDGET_WINDOW_EXPIRED`）都拒绝新保留；**已完成签名继续验真**（verify 识别全部历史版本）。 |
+| **跨主体挪用** | 保留的主体/用途/密钥版本必须与预算单一致；不同主体 403 `FORBIDDEN`，篡改档案被离线检查器判 `CROSS_SUBJECT_DIVERSION`。 |
+| **人工处理悬挂保留** | 暂停/恢复/修订/主体管理仅 ROOT_OWNER（`budget:admin`/`budget:handle` 能力）。人工归还必须填写理由，审计记录**操作者、理由、处理前后的保留量**；已有签名审计的保留**不能释放**（`RESERVATION_HAS_SIGNATURE`），只能结算。 |
+| **控制台与网络接口** | `/budgets` 页面与 `/api/budgets/status`（免登录只读）展示总量/可用/保留/消费/租期与每请求结算状态；带令牌接口支持创建、修订、暂停、恢复、接管、人工释放。凭据与签名不进入公开状态接口。 |
+| **可验证档案** | 预算单、修订链、保留凭据、签名摘要、消费/归还记录全部在同一条哈希链审计中；导出包新增 `sign_budgets` 段，总核验新增 `sign_budgets_ok`。 |
+| **离线检查器** | `kc.budget_verify`（`python -m kc.budget_cli verify-bundle export.json`）重放每次数量变化并重算各时点账本，检出：伪造预算 `FORGED_BUDGET`、重复消费 `DOUBLE_SPEND`、超额签名 `OVER_BUDGET`、跨主体挪用 `CROSS_SUBJECT_DIVERSION`、过期后保留 `RESERVATION_AFTER_WINDOW`、修订号回退 `REVISION_ROLLBACK`、缩减低于下限 `SHRINK_BELOW_FLOOR`、释放已有签名的保留 `RELEASE_WITH_SIGNATURE`、只有消费没有签名 `CONSUME_WITHOUT_SIGNATURE`、有签名却没有预算结算 `SIGNATURE_WITHOUT_SETTLEMENT`、引用不存在保留 `BAD_RESERVATION_CREDENTIAL`。 |
+
+预算接口（HTTP 层按职责放行；库 `Orchestrator.budgets` 直调不加门禁）：
+
+```
+GET  /api/budgets/status                 # 免登录：总量/可用/保留/消费/租期/每请求状态
+GET  /api/sign-budgets /api/sign-requests?budget_id=
+POST /api/sign-budgets/subjects          # 注册调用主体（owner）
+POST /api/sign-subjects/{id}/revoke      # 撤销主体
+POST /api/sign-budgets                   # 创建预算单（owner）
+POST /api/sign-budgets/{id}/revise       # 修订（base_revision 乐观并发）
+POST /api/sign-budgets/{id}/{pause|resume}
+POST /api/sign-requests/{id}/takeover    # 按签名审计判定 settle/release（签名者可调用）
+POST /api/sign-requests/sweep            # 批量处理全部过期保留
+POST /api/sign-requests/{id}/release     # 人工释放（owner，理由必填，有签名必拒）
+POST /api/sign                           # 有预算单时必须带 request_id(+subject)，无预算单走旧路径
+```
+
+命令行：
+
+```bash
+python -m kc.budget_cli subject --root ./kc-data --id svc-billing --name Billing
+python -m kc.budget_cli create  --root ./kc-data --purpose root-signing \
+    --key kv_xxx --subject svc-billing --total 1000 --batch-cap 25 \
+    --valid-until 2026-12-31T00:00:00Z --lease-seconds 30 --actor alice
+python -m kc.budget_cli revise|pause|resume --root ./kc-data --budget bg_xxx ...
+python -m kc.budget_cli takeover --root ./kc-data --request req-1
+python -m kc.budget_cli release  --root ./kc-data --request req-1 \
+    --operator alice --reason "worker host decommissioned"
+python -m kc.budget_cli verify  --root ./kc-data
+python -m kc.budget_cli verify-bundle export.json
+```
+
+`tests/test_budgets.py`（36 个场景：连续消耗到零、线程/进程争抢最后额度、
+相同请求号重放、保留后退出且已/未签名、事件溯源恢复、缩减下限与并发修订冲突、
+暂停恢复、主体撤销、时间窗、批量保留、凭据伪造、在途保护、退役/销毁旧版本
+签名验真、无预算兼容、人工处理留痕、完整档案与 11 类被修改档案）与
+`tests/budget_http_e2e.py` 覆盖全部验收项。审计中只出现主体/预算/请求标识、
+消息与签名的摘要；签名私钥材料从不入预算审计。
+
+---
+
+
 
 ## 2. 目录结构
 
@@ -251,6 +320,13 @@ kc/
                   split-view 冻结与带原因处置
   transparency_verify.py 独立检查器：重算全部根/证明/head 链/生命周期/双根/未登记激活
   transparency_cli.py 独立检查命令行（verify export.json|section.json）
+  budgets.py      签名用量预算：预算单 + 递增修订链、调用主体、短租期保留、
+                  保留凭据（HMAC）、签名审计、结算/归还、崩溃接管与事件溯源恢复
+  budget_verify.py 预算离线检查器：重放每次数量变化，检出伪造/重复消费/超额/
+                  跨主体挪用/过期保留/修订回退/释放已签名/只消费无签名等
+  budget_cli.py   预算命令行（subject/create/revise/pause/resume/takeover/
+                  sweep/release/verify/verify-bundle）
+  budget.html     预算控制台 UI（预算单、计数器、租期、每请求状态、人工处理）
   transparency.html 透明度管理页面：浏览器侧 Web Crypto + 纯 JS Ed25519 自行验算
   sessions.py     终端证明登录：挑战/报价、绑定人员·职责·终端·时效的会话令牌
   authz.py        四眼授权单：冻结摘要/截止、互补职责矩阵、决策链、单次执行
@@ -275,8 +351,15 @@ tests/
                       业务去重、矛盾状态/换钥阻止 head、多进程单序并发、四类中断
                       原子前滚/回滚、split-view 冻结/冻结期阻断激活/处置恢复/重启保留、
                       嵌入编排器两代证明与多次变更一致性、独立检查器 10 类检出）
+  test_budgets.py     36 个签名用量预算场景（耗尽/线程与真实进程争抢/幂等重放/
+                      保留后退出已签与未签/事件溯源恢复/修订冲突与缩减下限/暂停恢复/
+                      撤销/时间窗/批量/凭据与在途保护/退役销毁旧签验真/无预算兼容/
+                      人工留痕/完整档案 + 11 类篡改档案）
   http_e2e.py         HTTP 全流程含登录门禁、四类授权单、6 路并发批准、库直调不受限
   drill_http_e2e.py   演练 HTTP 全流程（区域/修订/扫描/续跑/镜像/冻结/租约/受阻清理/证据）
+  budget_http_e2e.py  预算 HTTP 全流程（职责门禁、创建/修订/暂停、网络签名与重放、
+                      12 路争抢、真实子进程崩溃接管、人工释放、免登录状态接口、
+                      完整档案与被修改档案的离线检出）
   transparency_http_e2e.py 透明度 HTTP 全流程（公开证明、node 执行页面 JS 浏览器侧验算、
                       gossip 冻结、冻结期四眼发布被阻、历史验签可用、owner 带原因
                       处置后四眼发布恢复、一致性严格追加、拒绝分支留证）
@@ -380,7 +463,13 @@ single_active_per_purpose / handover_consistent`。
 | POST | `/api/ceremonies/{id}/commit` | 法定人数齐备后提交（DESTROY 走 PURGE_RETIRED 授权单） |
 | POST | `/api/ceremonies/{id}/publish` | **已改为四眼**：PUBLISH_GENERATION 授权单批准时执行 CAS |
 | POST | `/api/ceremonies/{id}/abort` | **已改为四眼**：ABORT_ACTIVE 授权单 |
-| POST | `/api/sign` `/api/verify` | 签名测试接口（签名按职责放行） |
+| POST | `/api/sign` `/api/verify` | 签名测试接口（签名按职责放行；有预算单时 `/api/sign` 需带 `request_id`，见第 1f 节） |
+| POST | `/api/sign-budgets[/subjects\|/{id}/revise\|/{id}/pause\|/{id}/resume]` | 预算单创建/修订/暂停/恢复（仅 owner） |
+| POST | `/api/sign-subjects/{id}/revoke` | 撤销调用主体（仅 owner） |
+| POST | `/api/sign-requests/sweep` `/api/sign-requests/{id}/takeover` | 过期保留批量/单个接管：按签名审计 settle 或 release |
+| POST | `/api/sign-requests/{id}/release` | 人工释放悬挂保留（仅 owner，理由必填，有签名必拒） |
+| GET | `/api/sign-budgets` `/api/sign-requests` | 预算与每请求结算状态（sign_budgets 读域） |
+| GET | `/api/budgets/status` | **免登录**控制台数据（不含凭据/签名） |
 | GET | `/api/keys` `/api/ceremonies` `/api/audit` `/api/export` | 只读视图（审计/导出仅 owner、witness） |
 
 > 注意：这些门禁只在 HTTP 层。直接使用 `Orchestrator`（库）时，

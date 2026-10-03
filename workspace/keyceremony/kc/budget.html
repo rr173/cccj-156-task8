@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8"/>
+<title>签名用量预算控制台</title>
+<style>
+  :root { --bg:#0f1420; --panel:#171e2e; --line:#27314a; --ink:#d8e0f0;
+          --muted:#8a97b5; --ok:#3fd08a; --warn:#f0b34a; --err:#ef6a6a;
+          --accent:#6aa6ff; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink);
+         font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;}
+  header { padding:14px 20px; border-bottom:1px solid var(--line);
+           display:flex; align-items:baseline; gap:14px; flex-wrap:wrap; }
+  header h1 { font-size:16px; margin:0; letter-spacing:.5px; }
+  header span { color:var(--muted); font-size:12px; }
+  main { display:grid; grid-template-columns: 1fr 1fr; gap:14px; padding:14px; }
+  .panel { background:var(--panel); border:1px solid var(--line);
+           border-radius:10px; padding:14px; min-height:90px; }
+  .panel h2 { font-size:12px; text-transform:uppercase; letter-spacing:1px;
+              color:var(--muted); margin:0 0 10px; }
+  .full { grid-column: 1 / -1; }
+  table { width:100%; border-collapse:collapse; font-size:12.5px; }
+  td, th { text-align:left; padding:5px 8px; border-bottom:1px solid var(--line);
+           vertical-align:top; }
+  th { color:var(--muted); font-weight:600; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px;
+          font-size:11px; border:1px solid var(--line); }
+  .ACTIVE, .CONSUMED { color:var(--ok); border-color:var(--ok); }
+  .PAUSED, .HELD { color:var(--warn); border-color:var(--warn); }
+  .RELEASED { color:var(--muted); border-color:var(--muted); }
+  .row { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:8px; align-items:center; }
+  input, select, button, textarea, label { background:#0d1220; color:var(--ink);
+    border:1px solid var(--line); border-radius:7px; padding:7px 10px;
+    font:inherit; }
+  label { border:none; padding:0; color:var(--muted); }
+  button { cursor:pointer; }
+  button:disabled { color:var(--muted); border-color:var(--line); cursor:not-allowed; }
+  button.primary { border-color:var(--accent); color:var(--accent); }
+  button.danger { border-color:var(--err); color:var(--err); }
+  button.good { border-color:var(--ok); color:var(--ok); }
+  pre { white-space:pre-wrap; word-break:break-all; max-height:300px;
+        overflow:auto; background:#0c1120; border:1px solid var(--line);
+        border-radius:8px; padding:10px; }
+  #toast { position:fixed; right:16px; bottom:16px; max-width:560px;
+           background:#10182b; border:1px solid var(--line); border-radius:8px;
+           padding:10px 14px; display:none; z-index:9; }
+  #toast.err { border-color:var(--err); color:var(--err); }
+  #toast.ok { border-color:var(--ok); color:var(--ok); }
+  small, .muted { color:var(--muted); }
+  .num { font-weight:600; }
+  .avail { color:var(--accent); }
+</style>
+</head>
+<body>
+<header>
+  <h1>签名用量预算 · SIGNING QUOTA BUDGETS</h1>
+  <span>预算单 · 修订链 · 短租期保留 · 保留凭据 · 消费/归还审计</span>
+  <span style="margin-left:auto" id="hud"><small>未登录（面板仍只读刷新）</small>
+    <button onclick="refreshAll()">刷新</button>
+    <button onclick="logout()" id="btnLogout" hidden>退出</button></span>
+</header>
+
+<main>
+  <section class="panel full" id="loginPanel">
+    <h2>操作员登录（终端证明）</h2>
+    <div class="row">
+      <input id="loginDev" placeholder="终端 id，例如 dev_alice" value="dev_alice"/>
+      <button class="primary" onclick="login()">证明终端并登录</button>
+      <small>预算单创建/修订/暂停/恢复/人工处理仅 ROOT_OWNER；签名调用按预算单上的调用主体放行。</small>
+    </div>
+  </section>
+
+  <section class="panel full">
+    <h2>预算单（总量 / 可用 / 保留 / 消费 / 租期）</h2>
+    <table id="budgetsTable"><thead><tr>
+      <th>预算/用途</th><th>主体</th><th>密钥版本</th><th>状态</th>
+      <th>总量</th><th>可用</th><th>保留</th><th>消费</th><th>归还</th>
+      <th>单批上限</th><th>租期(秒)</th><th>修订</th><th>时间窗</th><th>操作</th>
+    </tr></thead><tbody></tbody></table>
+  </section>
+
+  <section class="panel">
+    <h2>创建预算单（安全负责人）</h2>
+    <div class="row"><label>用途</label><input id="cPurpose" value="root-signing"/></div>
+    <div class="row"><label>主体</label><input id="cSubject" placeholder="subject id"/>
+      <input id="cSubjectName" placeholder="主体名称" style="width:120px"/>
+      <button onclick="createSubject()">注册主体</button></div>
+    <div class="row"><label>密钥版本 id</label><input id="cKey" style="width:240px"/></div>
+    <div class="row"><label>总量</label><input id="cTotal" value="10" style="width:80px"/>
+      <label>单批上限</label><input id="cBatch" value="1" style="width:70px"/>
+      <label>租期(秒)</label><input id="cLease" value="30" style="width:70px"/></div>
+    <div class="row"><label>有效时长(秒，自现在起)</label>
+      <input id="cWindow" value="3600" style="width:100px"/>
+      <label>理由</label><input id="cReason" style="width:160px"/></div>
+    <div class="row"><button class="primary" onclick="createBudget()">创建预算单</button>
+      <small>密钥版本 id 可在 <a href="/" style="color:var(--accent)">仪式控制台</a> /api/keys 查看</small></div>
+  </section>
+
+  <section class="panel">
+    <h2>签名入口（有预算单时走保留→签名→结算）</h2>
+    <div class="row"><label>用途</label><input id="sPurpose" value="root-signing"/></div>
+    <div class="row"><label>请求号</label><input id="sReq" placeholder="唯一 request id"/></div>
+    <div class="row"><label>主体</label><input id="sSubject" placeholder="默认=登录人员"/></div>
+    <div class="row"><label>消息</label><input id="sMsg" value="hello"/></div>
+    <div class="row"><button class="good" onclick="doSign()">提交签名</button>
+      <small>相同请求号再次提交返回第一次的签名与结算记录（幂等）。</small></div>
+    <pre id="signOut" hidden></pre>
+  </section>
+
+  <section class="panel full">
+    <h2>每个请求的结算状态 / 人工处理长期悬挂保留</h2>
+    <table id="reqsTable"><thead><tr>
+      <th>请求号</th><th>预算</th><th>主体</th><th>数量</th><th>状态</th>
+      <th>保留时间</th><th>租期截止</th><th>结算时间</th><th>签名审计摘要</th>
+      <th>处理</th>
+    </tr></thead><tbody></tbody></table>
+  </section>
+
+  <section class="panel full">
+    <h2>结果</h2>
+    <pre id="out" hidden></pre>
+  </section>
+</main>
+<div id="toast"></div>
+
+<script>
+let token = null, me = null;
+function toast(msg, ok){ const t = document.getElementById('toast');
+  t.textContent = msg; t.className = ok ? 'ok' : 'err'; t.style.display='block';
+  setTimeout(()=>t.style.display='none', 6000); }
+async function api(path, method='GET', body){
+  const opt = {method, headers:{'Content-Type':'application/json'}};
+  if (token) opt.headers['Authorization'] = 'Bearer ' + token;
+  if (body) opt.body = JSON.stringify(body);
+  const r = await fetch(path, opt);
+  const j = await r.json().catch(()=>({}));
+  if (!r.ok) { showOut(j); throw Object.assign(new Error(j.error||('HTTP '+r.status)), {j}); }
+  return j;
+}
+function showOut(j){ const el=document.getElementById('out'); el.hidden=false;
+  el.textContent = JSON.stringify(j,null,2); }
+function fmtTs(v){ if(v==null) return ''; return new Date(v*1000).toISOString(); }
+
+async function login(){
+  const did = document.getElementById('loginDev').value.trim();
+  await api('/api/session/login-challenge','POST',{device_id:did});
+  me = await api('/api/session/login','POST',{device_id:did});
+  token = me.token;
+  document.getElementById('hud').firstElementChild.textContent =
+    `${me.participant_id} · ${me.role} · ${me.device_id}`;
+  document.getElementById('btnLogout').hidden = false;
+  document.getElementById('sSubject').value = me.participant_id;
+  toast('已登录：' + me.participant_id, true);
+  refreshAll();
+}
+async function logout(){ token=null; location.reload(); }
+
+async function createSubject(){
+  const subject = document.getElementById('cSubject').value.trim();
+  const name = document.getElementById('cSubjectName').value.trim();
+  try { showOut(await api('/api/sign-budgets/subjects','POST',{subject,name}));
+    toast('主体已注册', true); refreshAll();
+  } catch(e){ toast(String(e.message)); }
+}
+async function createBudget(){
+  const windowSec = parseFloat(document.getElementById('cWindow').value);
+  const body = {
+    purpose: document.getElementById('cPurpose').value.trim(),
+    subject: document.getElementById('cSubject').value.trim(),
+    key_version_id: document.getElementById('cKey').value.trim(),
+    total: parseInt(document.getElementById('cTotal').value,10),
+    batch_cap: parseInt(document.getElementById('cBatch').value,10),
+    lease_seconds: parseInt(document.getElementById('cLease').value,10),
+    valid_until: (Date.now()/1000) + windowSec,
+    reason: document.getElementById('cReason').value.trim(),
+  };
+  try { showOut(await api('/api/sign-budgets','POST',body));
+    toast('预算单已创建', true); refreshAll();
+  } catch(e){ toast(String(e.message)); }
+}
+async function doSign(){
+  const req = document.getElementById('sReq').value.trim();
+  if (!req) { toast('预算内签名必须提供唯一请求号'); return; }
+  try {
+    const j = await api('/api/sign','POST',{
+      purpose: document.getElementById('sPurpose').value.trim(),
+      request_id: req,
+      subject: document.getElementById('sSubject').value.trim() || undefined,
+      message: document.getElementById('sMsg').value});
+    const el = document.getElementById('signOut'); el.hidden=false;
+    el.textContent = JSON.stringify(j,null,2);
+    toast((j.replay?'幂等返回：':'签名完成：') + (j.signature_audit_digest||j.version_id), true);
+    refreshAll();
+  } catch(e){ toast(String(e.message)); }
+}
+async function act(bid, action, reason){
+  try { showOut(await api(`/api/sign-budgets/${bid}/${action}`,'POST',{reason:reason||''}));
+    toast('操作完成', true); refreshAll();
+  } catch(e){ toast(String(e.message)); }
+}
+async function revise(bid, rev){
+  const total = prompt(`基于修订 ${rev} 提交新总量（缩减不得小于 消费+保留）`);
+  if (total == null) return;
+  try {
+    showOut(await api(`/api/sign-budgets/${bid}/revise`,'POST',
+      {base_revision:rev, total:parseInt(total,10), reason:'web revise'}));
+    toast('修订成功', true); refreshAll();
+  } catch(e){
+    toast('修订冲突/被拒：' + e.message);
+    showOut(e.j);
+  }
+}
+async function takeover(rid){
+  try { showOut(await api(`/api/sign-requests/${rid}/takeover`,'POST',{}));
+    toast('接管判定完成', true); refreshAll();
+  } catch(e){ toast(String(e.message)); }
+}
+async function manualRelease(rid){
+  const reason = prompt(`人工释放悬挂保留 ${rid} 的理由（已有签名审计的请求会被拒绝）`);
+  if (!reason) return;
+  try { showOut(await api(`/api/sign-requests/${rid}/release`,'POST',{reason}));
+    toast('已人工归还', true); refreshAll();
+  } catch(e){ toast(String(e.message)); showOut(e.j); }
+}
+
+function budgetRow(b){
+  const tr = document.createElement('tr');
+  const win = `${fmtTs(b.valid_from)} → ${fmtTs(b.valid_until)}` +
+              (b.window_open ? '' : ' (已结束)');
+  tr.innerHTML = `
+    <td><b>${b.budget_id}</b><br><span class="muted">${b.purpose}</span></td>
+    <td>${b.subject}</td>
+    <td title="${b.key_version_id}">${b.key_version_id.slice(0,12)}…</td>
+    <td><span class="pill ${b.status}">${b.status}</span></td>
+    <td class="num">${b.total}</td>
+    <td class="num avail">${b.available}</td>
+    <td class="num">${b.held}</td>
+    <td class="num">${b.consumed}</td>
+    <td class="num">${b.released}</td>
+    <td>${b.batch_cap}</td>
+    <td>${b.lease_seconds}</td>
+    <td>${b.revision}</td>
+    <td><small>${win}</small></td>
+    <td></td>`;
+  const td = tr.lastElementChild;
+  const mk = (txt, cls, fn) => { const x=document.createElement('button');
+    x.textContent=txt; x.className=cls; x.onclick=fn; td.appendChild(x);
+    x.style.margin='2px'; return x; };
+  mk('修订','primary',()=>revise(b.budget_id,b.revision));
+  if (b.status==='ACTIVE') mk('暂停','danger',()=>act(b.budget_id,'pause',prompt('暂停理由')||''));
+  else mk('恢复','good',()=>act(b.budget_id,'resume',prompt('恢复理由')||''));
+  return tr;
+}
+function reqRow(r){
+  const tr = document.createElement('tr');
+  const sig = r.signature ? r.signature.audit_digest.slice(0,20)+'…' : '';
+  tr.innerHTML = `
+    <td><b>${r.request_id}</b><br><small>${r.reservation_id}</small></td>
+    <td><small>${r.budget_id.slice(0,12)}…</small></td>
+    <td>${r.subject}</td>
+    <td class="num">${r.quantity}</td>
+    <td><span class="pill ${r.state}">${r.state}</span></td>
+    <td><small>${fmtTs(r.held_at)}</small></td>
+    <td><small>${fmtTs(r.lease_expires_at)}</small></td>
+    <td><small>${fmtTs(r.settled_at)}</small></td>
+    <td><small>${sig}</small></td>
+    <td></td>`;
+  const td = tr.lastElementChild;
+  const mk = (txt, cls, fn) => { const x=document.createElement('button');
+    x.textContent=txt; x.className=cls; x.onclick=fn; td.appendChild(x);
+    x.style.margin='2px'; return x; };
+  mk('接管判定','primary',()=>takeover(r.request_id));
+  mk('人工释放','danger',()=>manualRelease(r.request_id));
+  return tr;
+}
+
+async function refreshAll(){
+  try {
+    const st = await api('/api/budgets/status');
+    const tb = document.querySelector('#budgetsTable tbody');
+    tb.innerHTML='';
+    (st.budgets||[]).forEach(b=>tb.appendChild(budgetRow(b)));
+    const trb = document.querySelector('#reqsTable tbody');
+    trb.innerHTML='';
+    (st.requests||[]).forEach(r=>{
+      r.signature = r.signature_audit_digest
+        ? {audit_digest:r.signature_audit_digest} : null;
+      trb.appendChild(reqRow(r));
+    });
+  } catch(e){ /* unauthenticated polling keeps the last rendered view */ }
+}
+refreshAll();
+setInterval(refreshAll, 3000);
+</script>
+</body>
+</html>

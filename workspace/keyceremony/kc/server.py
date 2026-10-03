@@ -51,9 +51,10 @@ from . import export as export_mod
 
 CONSOLE_HTML = os.path.join(os.path.dirname(__file__), "console.html")
 TRANSPARENCY_HTML = os.path.join(os.path.dirname(__file__), "transparency.html")
+BUDGET_HTML = os.path.join(os.path.dirname(__file__), "budget.html")
 
 PUBLIC_GET = {"/", "/index.html", "/health", "/transparency",
-              "/transparency.html"}
+              "/transparency.html", "/budgets", "/budgets.html"}
 PUBLIC_POST = {"/api/session/login-challenge", "/api/session/login"}
 
 # Device-step endpoints require the session to own the addressed terminal.
@@ -106,6 +107,9 @@ class Handler(BaseHTTPRequestHandler):
             val = getattr(e, attr, None)
             if val is not None:
                 body[attr] = val
+        details = getattr(e, "details", None)
+        if isinstance(details, dict) and details:
+            body["details"] = details
         self._send(e.http_status, body)
 
     def _token(self) -> str:
@@ -170,6 +174,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._serve_console()
         if path in ("/transparency", "/transparency.html"):
             return self._serve_transparency()
+        if path in ("/budgets", "/budgets.html"):
+            return self._serve_budget_page()
         if path == "/health":
             return self._send(200, {"ok": True})
 
@@ -179,6 +185,13 @@ class Handler(BaseHTTPRequestHandler):
             return self._with_ctx(
                 lambda ctx: self._transparency_query(ctx, path, q),
                 require_auth=False)
+
+        # Public, operator-safe budget dashboard data: totals/availability/
+        # holds/consumption/lease and per-request settlement status. No
+        # credentials or signatures are included.
+        if path == "/api/budgets/status":
+            return self._with_ctx(self._public_budget_status,
+                                  require_auth=False)
 
         def run(ctx):
             az = ctx.authz
@@ -225,6 +238,14 @@ class Handler(BaseHTTPRequestHandler):
                 reg = RegionRegistry(ctx.orch.state)
                 return {"regions": [reg.get(n).config_summary()
                                     for n in reg.names()]}
+            if path == "/api/sign-budgets":
+                bm = ctx.orch.budgets
+                return {"budgets": bm.list_budgets(),
+                        "subjects": dict(ctx.orch.state["sign_subjects"])}
+            if path == "/api/sign-requests":
+                bm = ctx.orch.budgets
+                budget_id = q.get("budget_id", [None])[0]
+                return {"requests": bm.list_requests(budget_id)}
             if path == "/api/audit":
                 probs = ctx.orch.audit.verify(
                     crypto.ed25519.public_from_secret(ctx.orch.seed))
@@ -284,6 +305,39 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(html)
         except FileNotFoundError:
             self._send(404, {"error": "transparency page unavailable"})
+
+    def _serve_budget_page(self):
+        try:
+            with open(BUDGET_HTML, "rb") as f:
+                html = f.read()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(html)))
+            self.end_headers()
+            self.wfile.write(html)
+        except FileNotFoundError:
+            self._send(404, {"error": "budget page unavailable"})
+
+    def _public_budget_status(self, ctx):
+        bm = ctx.orch.budgets
+        return {
+            "budgets": [
+                {k: b[k] for k in (
+                    "budget_id", "purpose", "subject", "key_version_id",
+                    "status", "total", "available", "held", "consumed",
+                    "released", "batch_cap", "lease_seconds", "revision",
+                    "valid_from", "valid_until", "window_open")}
+                for b in bm.list_budgets()],
+            "requests": [
+                {k: r.get(k) for k in (
+                    "request_id", "reservation_id", "budget_id", "subject",
+                    "quantity", "state", "held_at", "lease_expires_at",
+                    "settled_at", "released_at", "release_reason",
+                    "released_by")} | {
+                    "signature_audit_digest":
+                        (r.get("signature") or {}).get("audit_digest")}
+                for r in bm.list_requests()],
+        }
 
     # ---- unauthenticated login endpoints ---------------------------------
     def _public_session_path(self, ctx):
@@ -404,9 +458,30 @@ class Handler(BaseHTTPRequestHandler):
         # ---- signing test interface ----
         if path == "/api/sign":
             AZ.Authz.require_cap(ctx.session, "sign:use")
-            return o.sign(b["purpose"], b["message"].encode())
+            purpose = b["purpose"]
+            message = b["message"].encode()
+            # If a budget order exists for this purpose the request must go
+            # through hold -> sign -> settle with a unique request id and the
+            # subject named on the order. No order means the legacy path is
+            # used unchanged ("没有预算单的用途仍按原方式签名").
+            if ctx.orch.budgets.budget_for_purpose(purpose) is not None:
+                request_id = b.get("request_id")
+                if not request_id:
+                    raise PolicyViolation(
+                        "budgeted purpose requires a unique request_id")
+                subject = b.get("subject", ctx.session["participant_id"])
+                return ctx.orch.budgeted_sign(
+                    purpose=purpose, message=message,
+                    request_id=request_id, subject=subject)
+            return ctx.orch.sign(purpose, message)
         if path == "/api/verify":
-            return o.verify(b["purpose"], b["message"].encode(), b["sig"])
+            return ctx.orch.verify(b["purpose"], b["message"].encode(), b["sig"])
+
+        # ---- verifiable signing-quota budgets ----
+        if path.startswith("/api/sign-budgets") \
+                or path.startswith("/api/sign-requests") \
+                or path.startswith("/api/sign-subjects"):
+            return self._budget_dispatch(ctx, path)
 
         # ---- cross-region disaster recovery drills ----
         if path.startswith("/api/drill"):
@@ -620,6 +695,73 @@ class Handler(BaseHTTPRequestHandler):
             "latency_threshold_ms": int(b.get("latency_threshold_ms", 500)),
         }
 
+    # ---- signing-quota budgets -------------------------------------------
+    def _budget_dispatch(self, ctx, path: str):
+        b = ctx.body
+        bm = ctx.orch.budgets
+        actor = ctx.session["participant_id"]
+        parts = path.strip("/").split("/")
+        # /api/sign-budgets/subjects
+        if len(parts) == 3 and parts[2] == "subjects":
+            AZ.Authz.require_cap(ctx.session, "budget:admin")
+            return bm.register_subject(b["subject"], b.get("name", ""), actor)
+        # /api/sign-budgets/<id>/{pause|resume|revise}
+        # /api/sign-budgets/<id>/subjects/<subject>/revoke is handled below
+        if len(parts) == 4 and parts[1] == "sign-budgets":
+            bid, suffix = parts[2], parts[3]
+            AZ.Authz.require_cap(ctx.session, "budget:admin")
+            if suffix == "pause":
+                return {"budget": bm.pause(bid, actor, b.get("reason", ""))}
+            if suffix == "resume":
+                return {"budget": bm.resume(bid, actor, b.get("reason", ""))}
+            if suffix == "revise":
+                return {"budget": bm.revise_budget(
+                    bid, base_revision=int(b["base_revision"]), actor=actor,
+                    total=b.get("total"), batch_cap=b.get("batch_cap"),
+                    valid_from=b.get("valid_from"),
+                    valid_until=b.get("valid_until"),
+                    lease_seconds=b.get("lease_seconds"),
+                    reason=b.get("reason", ""))}
+            raise NotFound("unknown budget action: " + suffix)
+        # /api/sign-budgets/<id>/takeover  and /sweep live on requests too
+        if path == "/api/sign-budgets":
+            AZ.Authz.require_cap(ctx.session, "budget:admin")
+            return {"budget": bm.create_budget(
+                purpose=b["purpose"],
+                key_version_id=b["key_version_id"],
+                subject=b["subject"], total=int(b["total"]),
+                batch_cap=int(b.get("batch_cap", 1)),
+                valid_from=b.get("valid_from"),
+                valid_until=float(b["valid_until"]),
+                actor=actor, reason=b.get("reason", ""),
+                lease_seconds=int(b.get("lease_seconds", 30)))}
+        # request-level ops: /api/sign-requests/<id>/{takeover|release}
+        if path == "/api/sign-requests/sweep":
+            AZ.Authz.require_cap(ctx.session, "sign:use")
+            return {"verdicts": bm.sweep_expired(actor=actor)}
+        if parts[1] == "sign-requests":
+            if len(parts) < 4:
+                raise NotFound("request id required")
+            rid, suffix = parts[2], parts[3]
+            if suffix == "takeover":
+                # any signer worker can complete the protocol recovery for a
+                # crashed peer; the manager decides settle vs release from
+                # durable evidence.
+                AZ.Authz.require_cap(ctx.session, "sign:use")
+                return bm.take_over(request_id=rid, actor=actor)
+            if suffix == "release":
+                AZ.Authz.require_cap(ctx.session, "budget:handle")
+                return bm.manual_release(
+                    request_id=rid, operator=actor,
+                    reason=b.get("reason", ""))
+            raise NotFound("unknown request action: " + suffix)
+        # subject revocation: /api/sign-subjects/<id>/revoke
+        if parts[1] == "sign-subjects" and len(parts) == 4 \
+                and parts[3] == "revoke":
+            AZ.Authz.require_cap(ctx.session, "budget:admin")
+            return bm.revoke_subject(parts[2], actor, b.get("reason", ""))
+        raise NotFound("unknown budget path: " + path)
+
     # ---- ticket approval: frozen payload + preflight + one-shot execute ---
     def _approve_ticket(self, ctx):
         b = ctx.body
@@ -784,6 +926,8 @@ def _read_scope_for(path: str) -> str | None:
     if path in ("/api/drill-plans", "/api/drills", "/api/drill-regions") \
             or path.startswith("/api/drills/"):
         return "drills"
+    if path in ("/api/sign-budgets", "/api/sign-requests"):
+        return "sign_budgets"
     if path == "/api/audit":
         return "audit"
     if path == "/api/export":

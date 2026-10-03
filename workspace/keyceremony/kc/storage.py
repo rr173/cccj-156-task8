@@ -209,7 +209,7 @@ class Store:
     @staticmethod
     def _empty_state() -> dict:
         return {
-            "schema": 4,
+            "schema": 5,
             "participants": {},   # participant_id -> record
             "devices": {},        # device_id -> EnrolledDevice dict
             "policies": {},       # policy_id -> Policy dict
@@ -229,5 +229,11 @@ class Store:
             # caller-facing transparency log checkpoint (public-only leaves,
             # signed Merkle tree heads, split-view evidence) is initialized
             # lazily by TransparencyLog(embedded=True)
+            # verifiable signing-quota budgets (kc.budgets.BudgetManager):
+            # budget orders with a revision chain, calling subjects and
+            # per-request reservation/settlement records
+            "sign_subjects": {},  # subject id -> {revoked,...}
+            "sign_budgets": {},   # budget_id -> budget order record
+            "sign_requests": {},  # request_id -> reservation record
             "sequence": 0,
         }

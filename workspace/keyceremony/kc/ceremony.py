@@ -22,11 +22,13 @@ Guarantees implemented in this module
 
 from __future__ import annotations
 
+import hashlib
 import os
 import time
 
 from . import crypto, ed25519
 from . import policy as pol
+from .budgets import BudgetManager
 from .attestation import (
     DeviceWallet, EnrolledDevice, provision_device, verify_action_envelope,
     verify_quote,
@@ -64,6 +66,10 @@ def _now(clock) -> float:
     return float(clock())
 
 
+def hashlib_sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
 class Orchestrator:
     """All mutating operations must run within `with store.locked():`."""
 
@@ -82,6 +88,12 @@ class Orchestrator:
         self.tlog = TransparencyLog(
             service_seed=self.seed, state=self.state, clock=clock,
             embedded=True)
+        # Verifiable signing-quota budgets. Purposes without an order are
+        # invisible to this manager and keep the legacy sign path verbatim.
+        self.budgets = BudgetManager(
+            self.state, self.audit,
+            keys_by_id=self.state["keys"], clock=clock,
+            persist=self.save)
 
     # ======================================================================
     # enrollment / policy
@@ -908,11 +920,122 @@ class Orchestrator:
     # signing test interface
     # ======================================================================
     def sign(self, purpose: str, message: bytes) -> dict:
+        """Legacy signing path: only used when the purpose has no budget
+        order, and remains byte-for-byte compatible with the pre-budget
+        behavior."""
         sig, kv = self.dir.sign_purpose(purpose, message)
         return {"purpose": purpose, "version_id": kv["id"],
                 "version": kv["version"], "status": kv["status"],
                 "fingerprint": kv["fingerprint"],
-                "sig": crypto.b64e(sig)}
+                "sig": crypto.b64e(sig), "budgeted": False}
+
+    # -- verifiable usage-budget signing -----------------------------------
+    # The three durable steps (hold -> signature -> settle) each append a
+    # hash-chained audit entry. crash_after lets tests kill the worker
+    # between steps (the subprocess exits without saving; every step is
+    # durable the moment its audit entry is written, so a takeover on the
+    # reopened store sees exactly the right evidence).
+    def budgeted_sign(self, *, purpose: str, message: bytes,
+                      request_id: str, subject: str,
+                      crash_after: str | None = None) -> dict:
+        b = self.state["sign_budgets"]
+        if not any(x["purpose"] == purpose for x in b.values()):
+            # No budget order for this purpose: sign the old way.
+            return self.sign(purpose, message)
+        hold = self.budgets.hold(request_id=request_id, purpose=purpose,
+                                 subject=subject, quantity=1)
+        if hold.get("replay"):
+            return self._replayed_sign_result(purpose, message, hold)
+        cred = self.state["sign_requests"][request_id]["credential"]
+        if crash_after == "hold":
+            self._crash()
+        rec = self.state["sign_requests"][request_id]
+        kv = self.dir.get(rec["key_version_id"])
+        sig = self.dir.signer_sign(kv["id"], message)
+        sig_b64 = crypto.b64e(sig)
+        msg_digest = hashlib_sha256(message)
+        self.budgets.record_signature(
+            request_id=request_id, credential=cred,
+            key_version_id=kv["id"], message_digest=msg_digest,
+            signature=sig_b64)
+        if crash_after == "signature":
+            self._crash()
+        view = self.budgets.settle(request_id=request_id, credential=cred)
+        if crash_after == "settle":
+            self._crash()
+        return self._budgeted_sign_result(purpose, message, kv, sig_b64,
+                                          view, msg_digest)
+
+    def _replayed_sign_result(self, purpose: str, message: bytes,
+                              view: dict) -> dict:
+        kv = self.dir.get(view["key_version_id"])
+        sig_b64 = view["signature"]["signature"] if view.get("signature") \
+            else None
+        return {
+            "purpose": purpose, "request_id": view["request_id"],
+            "reservation_id": view["reservation_id"],
+            "budget_id": view["budget_id"], "subject": view["subject"],
+            "version_id": kv["id"], "version": kv["version"],
+            "status": kv["status"], "fingerprint": kv["fingerprint"],
+            "sig": sig_b64, "budgeted": True, "replay": True,
+            "settlement_state": view["state"],
+            "settled_at": view.get("settled_at"),
+            "signature_audit_digest":
+                (view["signature"] or {}).get("audit_digest"),
+        }
+
+    def _budgeted_sign_result(self, purpose, message, kv, sig_b64, view,
+                              msg_digest) -> dict:
+        return {
+            "purpose": purpose, "request_id": view["request_id"],
+            "reservation_id": view["reservation_id"],
+            "budget_id": view["budget_id"], "subject": view["subject"],
+            "version_id": kv["id"], "version": kv["version"],
+            "status": kv["status"], "fingerprint": kv["fingerprint"],
+            "sig": sig_b64, "budgeted": True,
+            "settlement_state": view["state"],
+            "settled_at": view.get("settled_at"),
+            "signature_audit_digest":
+                (view["signature"] or {}).get("audit_digest"),
+        }
+
+    def reservation(self, *, purpose: str, request_id: str, subject: str,
+                    quantity: int = 1) -> dict:
+        """Step 1 alone: take a quota reservation (batch signing entry)."""
+        view = self.budgets.hold(request_id=request_id, purpose=purpose,
+                                 subject=subject, quantity=quantity)
+        if view.get("replay"):
+            view["credential"] = self.state["sign_requests"][request_id] \
+                .get("credential")
+        else:
+            view["credential"] = self.state["sign_requests"][request_id] \
+                ["credential"]
+        return view
+
+    def settle_reservation(self, *, request_id: str, credential: str,
+                           signatures: list[str],
+                           key_version_id: str | None = None,
+                           messages_digest: str | None = None) -> dict:
+        """Steps 2+3 for a batch reservation: one signature audit (the
+        digest covers the ordered signature list), then consumption."""
+        rec = self.state["sign_requests"][request_id]
+        if len(signatures) != rec["quantity"]:
+            raise PolicyViolation(
+                f"reservation is for {rec['quantity']} signatures; "
+                f"{len(signatures)} presented")
+        kv = self.dir.get(rec["key_version_id"])
+        digest = messages_digest or hashlib_sha256(
+            crypto.dumps(signatures).encode())
+        self.budgets.record_signature(
+            request_id=request_id, credential=credential,
+            key_version_id=kv["id"], message_digest=digest,
+            signature=crypto.digest_hex({"sigs": signatures}))
+        return self.budgets.settle(request_id=request_id,
+                                   credential=credential)
+
+    @staticmethod
+    def _crash():
+        os._exit(17)
 
     def verify(self, purpose: str, message: bytes, sig_b64: str) -> dict:
         sig = crypto.b64d(sig_b64)

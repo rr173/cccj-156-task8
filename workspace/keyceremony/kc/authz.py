@@ -99,15 +99,17 @@ APPROVER_DUTIES: dict[str, frozenset[str]] = {
 READ_SCOPES: dict[str, frozenset[str]] = {
     P.ROOT_OWNER: frozenset(
         {"keys", "ceremonies", "policies", "participants",
-         "audit", "export", "tickets", "sessions", "drills"}),
+         "audit", "export", "tickets", "sessions", "drills",
+         "sign_budgets"}),
     P.KEY_STEWARD: frozenset(
         {"keys", "ceremonies", "policies", "participants", "tickets",
-         "drills"}),
+         "drills", "sign_budgets"}),
     P.WITNESS_SHAREHOLDER: frozenset(
         {"keys", "ceremonies", "policies", "participants",
-         "audit", "export", "tickets", "drills"}),
+         "audit", "export", "tickets", "drills", "sign_budgets"}),
     P.ENCLAVE_OPERATOR: frozenset(
-        {"keys", "ceremonies", "policies", "tickets", "drills"}),
+        {"keys", "ceremonies", "policies", "tickets", "drills",
+         "sign_budgets"}),
 }
 CAPABILITIES: dict[str, frozenset[str]] = {
     P.ROOT_OWNER: frozenset({
@@ -117,6 +119,10 @@ CAPABILITIES: dict[str, frozenset[str]] = {
         "drill:plan", "drill:scan", "drill:run", "drill:mirror",
         "drill:lease", "drill:failback", "drill:terminate",
         "transparency:resolve",
+        # signing-quota budgets: only the security lead writes orders and
+        # handles long-hung reservations; everyone with sign:use draws on
+        # budgets that name their subject.
+        "budget:admin", "budget:handle",
     }),
     P.KEY_STEWARD: frozenset({
         "ceremony:open", "device:step", "sign:use",
