@@ -1,0 +1,1072 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Key Directory Transparency Log</title>
+<style>
+  :root { --bg:#0f1420; --panel:#171e2e; --line:#27314a; --ink:#d8e0f0;
+          --muted:#8a97b5; --ok:#3fd08a; --warn:#f0b34a; --err:#ef6a6a;
+          --accent:#6aa6ff; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink);
+         font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;}
+  header { padding:14px 20px; border-bottom:1px solid var(--line);
+           display:flex; align-items:baseline; gap:14px; flex-wrap:wrap; }
+  header h1 { font-size:16px; margin:0; letter-spacing:.5px; }
+  header span, header a { color:var(--muted); font-size:12px; }
+  main { display:grid; grid-template-columns:1fr 1fr; gap:14px; padding:14px; }
+  .panel { background:var(--panel); border:1px solid var(--line);
+           border-radius:10px; padding:14px; min-height:120px; }
+  .panel h2 { font-size:12px; text-transform:uppercase; letter-spacing:1px;
+              color:var(--muted); margin:0 0 10px; }
+  .full { grid-column:1 / -1; }
+  table { width:100%; border-collapse:collapse; font-size:12.5px; }
+  td,th { text-align:left; padding:5px 8px; border-bottom:1px solid var(--line);
+          vertical-align:top; word-break:break-all; }
+  th { color:var(--muted); font-weight:600; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px;
+          font-size:11px; border:1px solid var(--line); }
+  .ok { color:var(--ok); } .fail { color:var(--err); }
+  .PASS { color:var(--ok); border-color:var(--ok); }
+  .FAIL { color:var(--err); border-color:var(--err); }
+  .FROZEN, .OPEN { color:var(--err); border-color:var(--err); }
+  .RESOLVED { color:var(--ok); border-color:var(--ok); }
+  .row { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:8px; align-items:center; }
+  input,select,button,textarea { background:#0d1220; color:var(--ink);
+    border:1px solid var(--line); border-radius:7px; padding:7px 10px; font:inherit; }
+  textarea { width:100%; min-height:90px; }
+  button { cursor:pointer; }
+  button.primary { border-color:var(--accent); color:var(--accent); }
+  button.danger { border-color:var(--err); color:var(--err); }
+  pre { white-space:pre-wrap; word-break:break-all; max-height:260px;
+        overflow:auto; background:#0c1120; border:1px solid var(--line);
+        border-radius:8px; padding:10px; font-size:12px; }
+  .verdict { font-weight:700; padding:2px 9px; border-radius:999px;
+             border:1px solid var(--line); display:inline-block; }
+  .muted { color:var(--muted); }
+  .mono { font-size:11.5px; color:var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <h1>密钥目录透明度日志</h1>
+  <span>浏览器本地重算包含/一致性路径与 head 签名 —— 不信任“接口成功”</span>
+  <span style="flex:1"></span>
+  <a href="/">← 仪式控制台</a>
+</header>
+<main>
+  <section class="panel" id="p-head">
+    <h2>当前 Tree Head</h2>
+    <div id="headview" class="mono">加载中…</div>
+    <div class="row" style="margin-top:10px">
+      <button class="primary" onclick="refresh()">刷新</button>
+      <button onclick="pinCurrent()">固定当前 head 为可信</button>
+      <span id="pinned" class="mono"></span>
+    </div>
+    <div class="row">
+      <span class="mono">本地固定可信 head：</span><span id="pininfo" class="mono"></span>
+      <button onclick="unpin()">清除固定</button>
+    </div>
+  </section>
+
+  <section class="panel" id="p-split">
+    <h2>Split-View 状态</h2>
+    <div id="splitview" class="mono"></div>
+    <div class="row" style="margin-top:10px">
+      <input id="observer" placeholder="观察方标识(可选)"/>
+      <button class="danger" onclick="submitObserved()">提交观察到的 head(粘贴于下)</button>
+    </div>
+    <textarea id="obshead" placeholder='粘贴外部见到的已签名 head JSON'></textarea>
+    <div id="obsresult" class="mono" style="margin-top:6px"></div>
+  </section>
+
+  <section class="panel full">
+    <h2>各用途最新公开版本 / 待记录事件</h2>
+    <div id="latest"></div>
+  </section>
+
+  <section class="panel full">
+    <h2>历史摘要链（浏览器逐条重算，判定与当前摘要一致）</h2>
+    <div class="row">
+      <input id="hist-size" placeholder="树大小(留空=最新)" style="width:140px"/>
+      <button class="primary" onclick="checkHistoryHead()">核查该高度摘要</button>
+      <span id="hist-progress" class="mono"></span>
+    </div>
+    <div id="histresult"></div>
+    <div id="histlist" style="margin-top:8px"></div>
+  </section>
+
+  <section class="panel">
+    <h2>查询包含证明（浏览器侧重算）</h2>
+    <div class="row">
+      <input id="inc-purpose" placeholder="purpose" value="root-signing"/>
+      <input id="inc-version" placeholder="版本号" style="width:90px"/>
+    </div>
+    <div class="row">
+      <input id="inc-vid" placeholder="或 version_id" style="flex:1"/>
+      <button class="primary" onclick="checkInclusion()">核查包含路径</button>
+    </div>
+    <div id="incresult"></div>
+  </section>
+
+  <section class="panel">
+    <h2>一致性：粘贴旧 head 核查严格追加</h2>
+    <div class="row">
+      <input id="cons-oldsize" placeholder="旧树大小" style="width:110px"/>
+      <input id="cons-oldroot" placeholder="旧根(可留空,用本地固定)" style="flex:1"/>
+    </div>
+    <div class="row">
+      <textarea id="cons-oldhead" placeholder="或直接粘贴旧的已签名 head JSON"></textarea>
+    </div>
+    <button class="primary" onclick="checkConsistency()">核查一致性</button>
+    <div id="consresult"></div>
+  </section>
+
+  <section class="panel full">
+    <h2>冲突分支与带原因处置（需 ROOT_OWNER 会话令牌）</h2>
+    <div class="row">
+      <input id="token" placeholder="Authorization Bearer 令牌" style="width:340px"/>
+    </div>
+    <div id="branches"></div>
+    <div class="row" style="margin-top:8px">
+      <input id="resolve-split" placeholder="split_id" style="width:200px"/>
+      <input id="resolve-reason" placeholder="处置原因(必填)" style="flex:1"/>
+    </div>
+    <button class="primary" onclick="resolveSplit()">选择本地可验证分支并恢复发布</button>
+    <div id="resolve-result" class="mono" style="margin-top:6px"></div>
+  </section>
+</main>
+
+<script>
+"use strict";
+const PIN_KEY = "kc-transparency-pinned-head-v1";
+let STATUS = null;
+
+// ---------------------------------------------------------------------------
+// canonical JSON (must match kc.crypto.dumps: sort keys, compact, ascii)
+// ---------------------------------------------------------------------------
+function canonical(value) {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value))
+    return "[" + value.map(canonical).join(",") + "]";
+  const keys = Object.keys(value).sort();
+  return "{" + keys.map(k => JSON.stringify(k) + ":" + canonical(value[k]))
+    .join(",") + "}";
+}
+async function sha256Bytes(bytes) {
+  return new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+}
+function asciiBytes(s) { return new TextEncoder().encode(s); }
+function hex(b) {
+  return [...b].map(x => x.toString(16).padStart(2, "0")).join("");
+}
+function unhex(h) {
+  h = h.replace(/\s+/g, "");
+  const out = new Uint8Array(h.length / 2);
+  for (let i = 0; i < out.length; i++)
+    out[i] = parseInt(h.substr(i * 2, 2), 16);
+  return out;
+}
+function eqBytes(a, b) {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+async function leafHash(leaf) {
+  const pre = new Uint8Array(1 + asciiBytes(canonical(leaf)).length);
+  pre[0] = 0x00;
+  pre.set(asciiBytes(canonical(leaf)), 1);
+  return sha256Bytes(pre);
+}
+async function nodeHash(l, r) {
+  const b = new Uint8Array(1 + l.length + r.length);
+  b[0] = 0x01; b.set(l, 1); b.set(r, 1 + l.length);
+  return sha256Bytes(b);
+}
+function emptyRoot() {
+  return hex(unhex("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"));
+}
+function hp2(n) { return 1 << (31 - Math.clz32(n - 1)); }
+
+async function mth(hashes, start, len) {
+  if (len === 1) return hashes[start];
+  const h = len >> 1;
+  return nodeHash(await mth(hashes, start, h),
+                  await mth(hashes, start + h, h));
+}
+async function subtreeRange(hashes, start, len) {
+  if (len === 1) return hashes[start];
+  const k = 1 << (31 - Math.clz32(len - 1));
+  if (k === len) return mth(hashes, start, len);
+  return nodeHash(await mth(hashes, start, k),
+                  await subtreeRange(hashes, start + k, len - k));
+}
+
+async function verifyInclusion(index, size, proof, leafH, root) {
+  if (size <= 0 || index < 0 || index >= size) return false;
+  let i = 0;
+  async function rebuild(m, n) {
+    if (n === 1) return leafH;
+    const k = hp2(n);
+    if (m < k)
+      return nodeHash(await rebuild(m, k), unhex(proof[i++]));
+    return nodeHash(unhex(proof[i++]), await rebuild(m - k, n - k));
+  }
+  let h;
+  try { h = await rebuild(index, size); } catch (e) { return false; }
+  if (i !== proof.length) return false;
+  return eqBytes(h, root);
+}
+
+async function verifyConsistency(m, n, proof, oldRoot, newRoot) {
+  if (m < 0 || m > n) return false;
+  if (m === 0)
+    return eqBytes(oldRoot, unhex("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"))
+      && proof.length === 0;
+  if (m === n) return eqBytes(oldRoot, newRoot) && proof.length === 0;
+  let i = 0;
+  const implicit = ((m & (m - 1)) === 0) ? oldRoot : null;
+  const BAD = unhex("00".repeat(32));
+  async function rebuild(mm, nn, seed) {
+    if (mm === nn) {
+      const hh = seed !== null ? seed : unhex(proof[i++]);
+      return [hh, hh];
+    }
+    const k = hp2(nn);
+    if (mm > k) {
+      const right = unhex(proof[i++]);
+      const [a, b] = await rebuild(mm - k, nn - k, null);
+      if (!eqBytes(b, right)) return [BAD, unhex("01".repeat(32))];
+      const left = unhex(proof[i++]);
+      return [await nodeHash(left, a), await nodeHash(left, b)];
+    }
+    if (mm === k) {
+      const s = seed !== null ? seed : unhex(proof[i++]);
+      const right = unhex(proof[i++]);
+      return [s, await nodeHash(s, right)];
+    }
+    const [a, b] = await rebuild(mm, k, seed);
+    const right = unhex(proof[i++]);
+    return [a, await nodeHash(b, right)];
+  }
+  let oldH, newH;
+  try { [oldH, newH] = await rebuild(m, n, implicit); }
+  catch (e) { return false; }
+  if (i !== proof.length) return false;
+  return eqBytes(oldH, oldRoot) && eqBytes(newH, newRoot);
+}
+
+// ---------------------------------------------------------------------------
+// Ed25519 (RFC 8032) ported from kc/ed25519.py; BigInt arithmetic
+// ---------------------------------------------------------------------------
+const Ed = (() => {
+  const P = 2n ** 255n - 19n;
+  const N = 2n ** 252n + 27742317777372353535851937790883648493n;
+  // JavaScript % keeps the sign of the dividend; field arithmetic needs the
+  // non-negative residue like Python's % operator.
+  function M(a) { const r = a % P; return r < 0n ? r + P : r; }
+  function modPow(b, e, m) {
+    let r = 1n; b = ((b % m) + m) % m;
+    while (e > 0n) { if (e & 1n) r = r * b % m; b = b * b % m; e >>= 1n; }
+    return r;
+  }
+  const d = M(-121665n * modPow(121666n, P - 2n, P));
+  function xrecover(y) {
+    const xx = M((y * y - 1n) * modPow(d * y * y + 1n, P - 2n, P));
+    let x = modPow(xx, (P + 3n) / 8n, P);
+    if (M(x * x - xx) !== 0n) x = x * modPow(2n, (P - 1n) / 4n, P) % P;
+    if (x & 1n) x = P - x;
+    return x;
+  }
+  const By = 4n * modPow(5n, P - 2n, P) % P;
+  const Bx = xrecover(By);
+  const B = [Bx, By, 1n, Bx * By % P];
+  const I = [0n, 1n, 1n, 0n];
+  function add(Pt, Q) {
+    const [X1, Y1, Z1, T1] = Pt, [X2, Y2, Z2, T2] = Q;
+    const A = M((Y1 - X1) * (Y2 - X2));
+    const Bb = ((Y1 + X1) * (Y2 + X2)) % P;
+    const C = (T1 * 2n * d * T2) % P;
+    const Dd = (Z1 * 2n * Z2) % P;
+    const E = M(Bb - A), F = M(Dd - C), G = (Dd + C) % P, H = (Bb + A) % P;
+    return [E * F % P, G * H % P, F * G % P, E * H % P];
+  }
+  function scalarMult(e, Pnt) {
+    let Q = I;
+    while (e > 0n) { if (e & 1n) Q = add(Q, Pnt); Pnt = add(Pnt, Pnt); e >>= 1n; }
+    return Q;
+  }
+  function enc(Pnt) {
+    const [X, Y, Z] = Pnt;
+    const zi = modPow(Z, P - 2n, P);
+    let x = X * zi % P, y = Y * zi % P;
+    let bits = y | ((x & 1n) << 255n);
+    // Ed25519 encodes 32 bytes little-endian; the sign bit is the high bit of
+    // the last byte (256-bit quantity still fits in 32 LE bytes).
+    const out = new Uint8Array(32);
+    for (let i = 0; i < 32; i++) { out[i] = Number(bits & 255n); bits >>= 8n; }
+    return out;
+  }
+  function dec(s) {
+    let bits = 0n;
+    for (let i = 31; i >= 0; i--) bits = (bits << 8n) | BigInt(s[i]);
+    const sign = bits >> 255n;
+    let y = bits & ((1n << 255n) - 1n);
+    let x = xrecover(y);
+    if ((x & 1n) !== sign) x = P - x;
+    return [x, y, 1n, x * y % P];
+  }
+  function hint(m) {
+    // SHA-512 via subtle isn't SHA-512; implement using a small sha512 below
+    return Sha512.hash(m);
+  }
+  function secretScalar(seed) {
+    const h = Sha512.hash(seed);
+    let a = 0n;
+    for (let i = 0; i < 32; i++) a = (a << 8n) | BigInt(h[31 - i]); // little-endian
+    a &= (1n << 254n) - 8n;
+    a |= 1n << 254n;
+    return a % N;
+  }
+  function verify(pub, msg, sig) {
+    try {
+      if (pub.length !== 32 || sig.length !== 64) return false;
+      const A = dec(pub), R = dec(sig.slice(0, 32));
+      let S = 0n;                                  // little-endian scalar
+      for (let i = 63; i >= 32; i--) S = (S << 8n) | BigInt(sig[i]);
+      if (S >= N) return false;
+      const cat = new Uint8Array(32 + 32 + msg.length);
+      cat.set(sig.slice(0, 32), 0); cat.set(pub, 32); cat.set(msg, 64);
+      const hh = Sha512.hash(cat);
+      let hnum = 0n;                               // little-endian scalar
+      for (let i = 63; i >= 0; i--) hnum = (hnum << 8n) | BigInt(hh[i]);
+      hnum %= N;
+      const lhs = scalarMult(S, B);
+      const rhs = add(R, scalarMult(hnum, A));
+      return hex(enc(lhs)) === hex(enc(rhs));
+    } catch (e) { return false; }
+  }
+  function pubFromSeed(seed) { return enc(scalarMult(secretScalar(seed), B)); }
+  return { verify, pubFromSeed, enc, dec };
+})();
+
+// minimal SHA-512 (needed by Ed25519 only)
+const Sha512 = (() => {
+  const K = [0x428a2f98d728ae22n,0x7137449123ef65cdn,0xb5c0fbcfec4d3b2fn,0xe9b5dba58189dbbcn,
+    0x3956c25bf348b538n,0x59f111f1b605d019n,0x923f82a4af194f9bn,0xab1c5ed5da6d8118n,
+    0xd807aa98a3030242n,0x12835b0145706fben,0x243185be4ee4b28cn,0x550c7dc3d5ffb4e2n,
+    0x72be5d74f27b896fn,0x80deb1fe3b1696b1n,0x9bdc06a725c71235n,0xc19bf174cf692694n,
+    0xe49b69c19ef14ad2n,0xefbe4786384f25e3n,0x0fc19dc68b8cd5b5n,0x240ca1cc77ac9c65n,
+    0x2de92c6f592b0275n,0x4a7484aa6ea6e483n,0x5cb0a9dcbd41fbd4n,0x76f988da831153b5n,
+    0x983e5152ee66dfabn,0xa831c66d2db43210n,0xb00327c898fb213fn,0xbf597fc7beef0ee4n,
+    0xc6e00bf33da88fc2n,0xd5a79147930aa725n,0x06ca6351e003826fn,0x142929670a0e6e70n,
+    0x27b70a8546d22ffcn,0x2e1b21385c26c926n,0x4d2c6dfc5ac42aedn,0x53380d139d95b3dfn,
+    0x650a73548baf63den,0x766a0abb3c77b2a8n,0x81c2c92e47edaee6n,0x92722c851482353bn,
+    0xa2bfe8a14cf10364n,0xa81a664bbc423001n,0xc24b8b70d0f89791n,0xc76c51a30654be30n,
+    0xd192e819d6ef5218n,0xd69906245565a910n,0xf40e35855771202an,0x106aa07032bbd1b8n,
+    0x19a4c116b8d2d0c8n,0x1e376c085141ab53n,0x2748774cdf8eeb99n,0x34b0bcb5e19b48a8n,
+    0x391c0cb3c5c95a63n,0x4ed8aa4ae3418acbn,0x5b9cca4f7763e373n,0x682e6ff3d6b2b8a3n,
+    0x748f82ee5defb2fcn,0x78a5636f43172f60n,0x84c87814a1f0ab72n,0x8cc702081a6439ecn,
+    0x90befffa23631e28n,0xa4506cebde82bde9n,0xbef9a3f7b2c67915n,0xc67178f2e372532bn,
+    0xca273eceea26619cn,0xd186b8c721c0c207n,0xeada7dd6cde0eb1en,0xf57d4f7fee6ed178n,
+    0x06f067aa72176fban,0x0a637dc5a2c898a6n,0x113f9804bef90daen,0x1b710b35131c471bn,
+    0x28db77f523047d84n,0x32caab7b40c72493n,0x3c9ebe0a15c9bebcn,0x431d67c49c100d4cn,
+    0x4cc5d4becb3e42b6n,0x597f299cfc657e2an,0x5fcb6fab3ad6faecn,0x6c44198c4a475817n];
+  const MASK64 = (1n << 64n) - 1n;
+  function rotr(x, n) { return ((x >> BigInt(n)) | (x << BigInt(64 - n))) & MASK64; }
+  function hash(msg) {
+    let H = [0x6a09e667f3bcc908n,0xbb67ae8584caa73bn,0x3c6ef372fe94f82bn,0xa54ff53a5f1d36f1n,
+      0x510e527fade682d1n,0x9b05688c2b3e6c1fn,0x1f83d9abfb41bd6bn,0x5be0cd19137e2179n];
+    const bytes = Array.from(msg);
+    const bitLen = BigInt(bytes.length) * 8n;
+    bytes.push(0x80);
+    while (bytes.length % 128 !== 112) bytes.push(0);
+    // 128-bit big-endian bit length: 8 zero bytes then 8 length bytes
+    for (let i = 0; i < 8; i++) bytes.push(0);
+    for (let i = 7; i >= 0; i--)
+      bytes.push(Number((bitLen >> BigInt(i * 8)) & 255n));
+    for (let off = 0; off < bytes.length; off += 128) {
+      const W = new Array(80);
+      for (let t = 0; t < 16; t++) {
+        let w = 0n;
+        for (let j = 0; j < 8; j++) w = (w << 8n) | BigInt(bytes[off + t * 8 + j]);
+        W[t] = w;
+      }
+      for (let t = 16; t < 80; t++) {
+        const s0 = rotr(W[t-15],1) ^ rotr(W[t-15],8) ^ (W[t-15] >> 7n);
+        const s1 = rotr(W[t-2],19) ^ rotr(W[t-2],61) ^ (W[t-2] >> 6n);
+        W[t] = (W[t-16] + s0 + W[t-7] + s1) & MASK64;
+      }
+      let [a,b,c,d,e,f,g,h] = H;
+      for (let t = 0; t < 80; t++) {
+        const S1 = rotr(e,14) ^ rotr(e,18) ^ rotr(e,41);
+        const ch = (e & f) ^ ((~e) & g);
+        const t1 = (h + S1 + ch + K[t] + W[t]) & MASK64;
+        const S0 = rotr(a,28) ^ rotr(a,34) ^ rotr(a,39);
+        const maj = (a & b) ^ (a & c) ^ (b & c);
+        const t2 = (S0 + maj) & MASK64;
+        h=g; g=f; f=e; e=(d+t1)&MASK64; d=c; c=b; b=a; a=(t1+t2)&MASK64;
+      }
+      H = [a,b,c,d,e,f,g,h].map((x,i)=>(x+H[i])&MASK64);
+    }
+    const out = new Uint8Array(64);
+    for (let i = 0; i < 8; i++)
+      for (let j = 7; j >= 0; j--)
+        out[i*8+(7-j)] = Number((H[i] >> BigInt(j*8)) & 255n);
+    return out;
+  }
+  return { hash };
+})();
+
+// ---------------------------------------------------------------------------
+// API + UI
+//
+// One shared evaluation drives every view. evaluateLog() fetches exactly the
+// data the trust decision needs, recomputes EVERYTHING in the browser (leaf
+// hashes, every prefix root, every head signature), and caches the result.
+// The current head panel, the history-chain panel, inclusion, consistency
+// and the split-resolution button all read the same EVAL object, so the same
+// signed head always yields the same verdict - browsing old summaries and
+// coming back, or reloading, cannot flip a badge.
+// ---------------------------------------------------------------------------
+const HEAD_DOMAIN_JS = "kc-transparency-head-v1";
+const ZERO_HASH_HEX = "0".repeat(64);
+let EVAL = null;          // last evaluateLog() result (single source of truth)
+let EVAL_EPOCH = 0;       // stale-render guard: a newer evaluation wins
+
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  return r.json();
+}
+function post(path, body, token) {
+  const h = {"Content-Type": "application/json"};
+  if (token) h["Authorization"] = "Bearer " + token;
+  return api(path, {method:"POST", headers:h, body:JSON.stringify(body)});
+}
+function verdict(ok, text) {
+  return `<span class="verdict ${ok?"PASS":"FAIL"}">${ok?"✔ 通过":"✘ 失败"}</span> ${text||""}`;
+}
+
+// log public key and tree_head_sig travel as base64 (crypto.b64e), never hex.
+function b64ToBytes(s) {
+  return Uint8Array.from(atob(String(s).trim()), c => c.charCodeAt(0));
+}
+function b64Maybe(s) {
+  try { return b64ToBytes(s); } catch (e) { return null; }
+}
+
+function headFields(head) {
+  return {domain:head.domain, tree_size:head.tree_size,
+    root_hash:head.root_hash, issued_at:head.issued_at,
+    prev_head_hash:head.prev_head_hash};
+}
+function headSigningBytes(head) {
+  return asciiBytes(canonical(headFields(head)));
+}
+// head_hash = sha256 over the canonical signed fields; the wire head also
+// carries tree_head_sig/head_hash which are NOT part of the digest.
+async function headHashHex(head) {
+  return hex(await sha256Bytes(headSigningBytes(head)));
+}
+function wellFormedHead(h) {
+  return h !== null && typeof h === "object" &&
+    h.domain === HEAD_DOMAIN_JS &&
+    Number.isInteger(h.tree_size) && h.tree_size >= 0 &&
+    typeof h.root_hash === "string" && /^[0-9a-f]{64}$/.test(h.root_hash) &&
+    typeof h.issued_at === "string" &&
+    typeof h.prev_head_hash === "string" &&
+    /^[0-9a-f]{64}$/.test(h.prev_head_hash) &&
+    typeof h.tree_head_sig === "string";
+}
+async function verifyHeadSig(pubBytes, head) {
+  if (!wellFormedHead(head)) return false;
+  const sig = b64Maybe(head.tree_head_sig);
+  if (!sig) return false;
+  try { return Ed.verify(pubBytes, headSigningBytes(head), sig); }
+  catch (e) { return false; }
+}
+function sameHead(a, b) {
+  if (!a || !b) return false;
+  for (const k of ["domain","tree_size","root_hash","issued_at",
+                   "prev_head_hash","tree_head_sig"])
+    if (a[k] !== b[k]) return false;
+  return true;
+}
+function loadPinned() {
+  try { return JSON.parse(localStorage.getItem(PIN_KEY) || "null"); }
+  catch (e) { return null; }
+}
+function savePinned(h) { localStorage.setItem(PIN_KEY, JSON.stringify(h)); }
+function clearPinned() { localStorage.removeItem(PIN_KEY); }
+function renderPin() {
+  const p = loadPinned();
+  document.getElementById("pininfo").textContent = p
+    ? `size=${p.tree_size} root=${(p.root_hash||"").slice(0,16)}…` : "(未固定)";
+}
+
+// ---------------------------------------------------------------------------
+// Shared, deterministic evaluation
+//
+// fetched once per refresh:
+//   status  - current head + per-purpose view + split evidence
+//   log-pub - log verification key
+//   leaves  - committed leaf bodies, in tree order
+//   heads   - signed head for every size 1..N (plus the lazy size-0 head)
+//
+// The browser then derives, with no further trust in the server:
+//   * every leaf hash 0x00‖canonical(leaf),
+//   * every prefix root MTH(0..k) incrementally from the leaf hashes,
+//   * every head's Ed25519 signature under log-pub,
+//   * every head_hash and the prev_head_hash linkage,
+//   * the binding root_hash == prefixRoot[size] at every size.
+// That is exactly the "is this summary really from this log, over exactly
+// these leaves" question; truncation, reordering, early-entry rewrite and a
+// path spliced from another tree all change one of the derived values.
+// ---------------------------------------------------------------------------
+function emptyRootBytes() {
+  return unhex("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+}
+async function rootOf(hashes) {
+  // RFC fold identical to kc tree_root
+  if (!hashes.length) return emptyRootBytes();
+  const n = hashes.length;
+  const k = 1 << (31 - Math.clz32(n - 1));
+  if (k === n) return mth(hashes, 0, n);
+  return nodeHash(await mth(hashes, 0, k),
+                  await subtreeRange(hashes, k, n - k));
+}
+
+// Prefix roots for a *different* sequence must not be mixed in: callers hand
+// in the exact ordered leaf hash list they evaluated; every result is keyed
+// by tree size and compared against the head at that same size.
+async function evaluateLog(onProgress) {
+  const report = async (msg, frac) => {
+    if (onProgress) { try { await onProgress(msg, frac); } catch (e) {} }
+  };
+  const out = {
+    ok: false, errors: [], leaves: [], leafHashes: [], prefixRoots: [],
+    heads: new Map(),   // size -> {head, checks:{...}, reasons:[...], trusted}
+    pubBytes: null, current: null, zero: null, fetched: 0, error: null,
+  };
+  function fail(reason) { out.errors.push(reason); }
+  let status, pubj, leavesResp;
+  try {
+    [status, pubj, leavesResp] = await Promise.all([
+      api("/api/transparency/status"),
+      api("/api/transparency/log-pub"),
+      api("/api/transparency/leaves"),
+    ]);
+  } catch (e) {
+    out.error = "status-fetch-failed";   // offline / harness: keep page inert
+    return out;
+  }
+  out.fetched = 1;
+  const pub = b64Maybe(pubj && pubj.log_pub);
+  if (!pub || pub.length !== 32) fail("日志公钥无法解码");
+  out.pubBytes = pub;
+
+  // ---- leaf set + prefix roots -------------------------------------------
+  const want0 = Math.max(0, (status && status.tree_size) || 0);
+  const leafBodies = Array.isArray(leavesResp.leaves) ? leavesResp.leaves : null;
+  if (!Array.isArray(leafBodies)) {
+    fail("叶子列表格式错误");
+  } else {
+    out.leaves = leafBodies;
+    if (leavesResp.tree_size !== leafBodies.length)
+      fail(`叶子数量 ${leafBodies.length} 与 tree_size ${leavesResp.tree_size} 不一致`);
+    const hs = [];
+    for (let i = 0; i < leafBodies.length; i++) {
+      hs.push(await leafHash(leafBodies[i]));
+      if ((i & 63) === 0)
+        await report(`重算叶子哈希 ${i + 1}/${leafBodies.length}`,
+                     (i + 1) / (leafBodies.length + status.tree_size + 2));
+    }
+    out.leafHashes = hs;
+    // Incremental RFC stack fold: after inserting the k-th leaf the folded
+    // stack is exactly MTH(leaf[0..k)) (same fold the exhaustive tests use
+    // against tree_root). O(n log n) total instead of recomputing each root.
+    const stack = [];                       // {w: power-of-two width, h}
+    out.prefixRoots[0] = emptyRootBytes();
+    for (let k = 0; k < hs.length; k++) {
+      let w = 1, cur = hs[k];
+      while (stack.length && stack[stack.length - 1].w === w) {
+        const top = stack.pop();
+        cur = await nodeHash(top.h, cur);
+        w *= 2;
+      }
+      stack.push({w, h: cur});
+      let r = stack[stack.length - 1].h;
+      for (let j = stack.length - 2; j >= 0; j--)
+        r = await nodeHash(stack[j].h, r);
+      out.prefixRoots[k + 1] = r;
+      if ((k & 63) === 0)
+        await report(`重算叶子/前缀根 ${k + 1}/${hs.length}`,
+                     (k + 1) / (hs.length + want0 + 2));
+    }
+  }
+
+  // ---- every signed head, independently fetched and checked --------------
+  const want = want0;
+  if (out.prefixRoots.length !== want + 1 || out.prefixRoots[want] === undefined)
+    fail("status.tree_size 与叶子集合不一致");
+
+  // Fetch all historical heads first (bounded concurrency) so a large log is
+  // not gated on one round trip per head; verification stays strictly in
+  // height order below so prev_head_hash linkage is meaningful.
+  await report("抓取历史摘要 1.." + want, 0.1);
+  const fetchedHeads = new Array(want + 1).fill(null);
+  {
+    const POOL = 8;
+    let next = 1;
+    const worker = async () => {
+      for (;;) {
+        const size = next++;
+        if (size > want) return;
+        try { fetchedHeads[size] = await api("/api/transparency/head?size=" + size); }
+        catch (e) { fetchedHeads[size] = {__error: String(e)}; }
+      }
+    };
+    await Promise.all(Array.from({length: Math.min(POOL, want)}, worker));
+  }
+
+  let prevExpected = ZERO_HASH_HEX;   // head_hash linkage starts at 0*64
+  for (let size = 1; size <= want; size++) {
+    const resp = fetchedHeads[size];
+    const fetchErr = resp && resp.__error ? resp.__error : null;
+    const head = resp && !resp.__error ? resp : null;
+    if ((size & 31) === 0 || size === want)
+      await report(`核验摘要签名 ${size}/${want}`,
+                   (out.leaves.length + size) /
+                   (out.leaves.length + want + 2));
+    const reasons = [];
+    const checks = {wellFormed: false, sig: false, size: false,
+                    root: false, prevLink: false, headHash: false};
+    if (!head || head.error) {
+      reasons.push("摘要缺失或无法获取" + (fetchErr ? "：" + fetchErr : ""));
+    } else {
+      checks.wellFormed = wellFormedHead(head);
+      if (!checks.wellFormed) reasons.push("摘要字段不完整/被改写");
+      if (pub) {
+        checks.sig = await verifyHeadSig(pub, head);
+        if (!checks.sig) reasons.push("Ed25519 签名无效");
+      }
+      checks.size = head.tree_size === size;
+      if (!checks.size) reasons.push(`tree_size=${head.tree_size} 与高度 ${size} 不符`);
+      const pr = out.prefixRoots[size];
+      checks.root = !!pr && head.root_hash === hex(pr);
+      if (!checks.root)
+        reasons.push(`root_hash 不等于本地 ${size} 叶前缀根（内容被改/删尾/换序/跨树）`);
+      if (head.prev_head_hash !== prevExpected)
+        reasons.push("prev_head_hash 未链接到前一摘要");
+      else checks.prevLink = true;
+      if (head.head_hash !== undefined) {
+        checks.headHash = await headHashHex(head) === head.head_hash;
+        if (!checks.headHash) reasons.push("head_hash 与本地重算不符");
+      } else {
+        checks.headHash = true;   // field absent on the wire is not a failure
+      }
+    }
+    const trusted = reasons.length === 0;
+    out.heads.set(size, {head, checks, reasons, trusted});
+    // linkage advances through the *fetched* record's own hash; a tampered
+    // record therefore also breaks the next record's link, chain-wide.
+    prevExpected = head ? await headHashHex(head) : prevExpected;
+  }
+
+  // size-0 head (empty log anchor) when the server offers one
+  if (want === 0 && status && status.head) {
+    const head = status.head;
+    const reasons = [];
+    const sig = !!(pub && (await verifyHeadSig(pub, head)));
+    if (!wellFormedHead(head)) reasons.push("摘要字段不完整");
+    if (!sig) reasons.push("Ed25519 签名无效");
+    if (head.tree_size !== 0 || head.root_hash !== hex(emptyRootBytes()))
+      reasons.push("空树根不匹配");
+    out.zero = {head, trusted: reasons.length === 0, reasons};
+  }
+
+  // ---- current head must be the stored head at the claimed size -----------
+  const cur = status && status.head;
+  const curRec = want > 0 ? out.heads.get(want) : out.zero;
+  if (!cur || !curRec || !curRec.head || !sameHead(cur, curRec.head)) {
+    fail("当前 head 与该高度存储的签名摘要不一致");
+  } else {
+    out.current = curRec;
+  }
+
+  const everyHeadTrusted = want > 0
+    ? [...out.heads.values()].every(r => r.trusted)
+    : !!(out.zero && out.zero.trusted);
+  out.ok = out.errors.length === 0 && everyHeadTrusted;
+  out.status = status;
+  return out;
+}
+
+async function refresh() {
+  const epoch = ++EVAL_EPOCH;
+  let status, pubj;
+  try {
+    [status, pubj] = await Promise.all([
+      api("/api/transparency/status"),
+      api("/api/transparency/log-pub"),
+    ]);
+  } catch (e) { return; }  // offline / test harness: leave page inert
+  STATUS = status;
+  renderPin(); renderSplit(); renderLatest(); renderBranches();
+  document.getElementById("headview").innerHTML =
+    '<span class="muted">浏览器重算中…</span>';
+  document.getElementById("hist-progress").textContent = "";
+  const ev = await evaluateLog((msg, frac) => {
+    if (epoch !== EVAL_EPOCH) return;
+    document.getElementById("hist-progress").textContent = msg;
+  });
+  if (epoch !== EVAL_EPOCH) return;   // a newer refresh superseded this run
+  EVAL = ev;
+  document.getElementById("hist-progress").textContent =
+    ev.ok ? `已重算 ${ev.status.tree_size} 叶 / ${ev.status.tree_size} 摘要` : "";
+  renderHead(); renderHistoryList(); renderPin();
+}
+
+function trustBadge(trusted, labelOk, labelBad) {
+  return `<span class="verdict ${trusted ? "PASS" : "FAIL"}">` +
+    `${trusted ? "✔ 可信" : "✘ 不可信"}</span> ` +
+    (trusted ? labelOk : labelBad);
+}
+
+async function renderHead() {
+  if (!EVAL || !STATUS) return;
+  const h = STATUS.head;
+  const cur = EVAL.current;
+  if (!cur) {
+    document.getElementById("headview").innerHTML =
+      verdict(false, "当前摘要与存储链不一致") +
+      `<pre class="mono">${(EVAL.errors||[]).join("\n")}</pre>`;
+    return;
+  }
+  const prefixN = EVAL.prefixRoots[h.tree_size];
+  const reasons = cur.trusted ? [] : cur.reasons.slice();
+  for (const e of EVAL.errors) reasons.push(e);
+  document.getElementById("headview").innerHTML =
+    `<div class="row"><span style="font-size:15px">` +
+    trustBadge(cur.trusted && EVAL.errors.length === 0,
+      "原样返回的服务器摘要：签名、重算根、链路全部本地成立",
+      "该摘要未通过浏览器本地核验：") +
+    `</span></div>
+    <table>
+      <tr><th>tree size</th><td>${h.tree_size}</td></tr>
+      <tr><th>root</th><td>${h.root_hash}</td></tr>
+      <tr><th>issued</th><td>${h.issued_at}</td></tr>
+      <tr><th>prev head</th><td>${h.prev_head_hash.slice(0,24)}…</td></tr>
+      <tr><th>浏览器重算根</th><td>${verdict(cur.checks.root,
+        `本地重算 ${h.tree_size} 叶前缀根 → ` +
+        `${prefixN ? hex(prefixN).slice(0,16) : "?"}…`)}</td></tr>
+      <tr><th>head 签名(浏览器验)</th><td>${verdict(cur.checks.sig,
+        "Ed25519 over canonical head（base64 传输）")}</td></tr>
+      <tr><th>head_hash 链接</th><td>${verdict(
+        cur.checks.headHash && cur.checks.prevLink,
+        "prev_head_hash 链与本地重算 head_hash 一致")}</td></tr>
+      <tr><th>整条历史链</th><td>${verdict(EVAL.ok,
+        `高度 1..${h.tree_size} 全部签名+根+链接成立`)}</td></tr>
+      <tr><th>冻结</th><td>${STATUS.frozen
+        ? '<span class="pill FROZEN">FROZEN '+STATUS.frozen.kind+'</span>'
+        : '<span class="pill PASS">正常发布</span>'}</td></tr>
+    </table>` +
+    (reasons.length
+      ? `<pre class="mono">${[...new Set(reasons)].map(x=>"· "+x).join("\n")}</pre>`
+      : "");
+}
+
+// One verdict per stored head, straight from the shared EVAL map - identical
+// to what the current panel shows for the same size.
+function renderHistoryList() {
+  if (!EVAL) return;
+  const el = document.getElementById("histlist");
+  const n = EVAL.status.tree_size;
+  if (!n) {
+    el.innerHTML = '<span class="muted">空日志（size=0 锚点' +
+      (EVAL.zero && EVAL.zero.trusted ? "可信" : "不可信") + "）。</span>";
+    return;
+  }
+  const lo = Math.max(1, n - 11);
+  let rows = "";
+  for (let size = n; size >= lo; size--) {
+    const r = EVAL.heads.get(size);
+    rows += `<tr><td>${size}</td>
+      <td class="mono">${r.head ? r.head.root_hash.slice(0,16) : "—"}…</td>
+      <td><span class="${r.trusted ? "ok" : "fail"}">` +
+      `${r.trusted ? "可信" : "不可信"}</span></td>
+      <td><button onclick="checkHistoryHead(${size})">重查</button></td></tr>`;
+  }
+  el.innerHTML = `<table><tr><th>size</th><th>root</th><th>判定</th><th></th></tr>` +
+    rows + "</table>" +
+    (lo > 1 ? `<div class="mono" style="margin-top:6px">仅显示最近 12 条；` +
+      `全部 ${n} 条均已在后台重算。</div>` : "");
+}
+
+async function checkHistoryHead(sizeArg) {
+  const el = document.getElementById("histresult");
+  let size = sizeArg;
+  if (size === undefined)
+    size = parseInt(document.getElementById("hist-size").value.trim(), 10);
+  if (!EVAL) { el.innerHTML = verdict(false, "评估尚未完成"); return; }
+  if (!Number.isInteger(size) || size < 1 || size > EVAL.status.tree_size) {
+    el.innerHTML = verdict(false,
+      `需要 1..${EVAL.status.tree_size} 之间的树大小`);
+    return;
+  }
+  // Independently fetch the historical head again and demand it is byte-for-
+  // byte the record the shared evaluation already verified at this size.
+  let fetched;
+  try { fetched = await api("/api/transparency/head?size=" + size); }
+  catch (e) { el.innerHTML = verdict(false, "历史摘要获取失败"); return; }
+  const r = EVAL.heads.get(size);
+  const same = r && r.head && sameHead(fetched, r.head);
+  const pr = EVAL.prefixRoots[size];
+  const ok = r.trusted && same && !!pr;
+  el.innerHTML =
+    `<div>${trustBadge(ok, `高度 ${size} 摘要为日志真实签发，且其根由当前叶子序列前 ${size} 条重算得到`,
+      `高度 ${size} 摘要未通过核验`)}</div>
+     <div>${verdict(r.checks.sig, "签名有效（log_pub 本地验）")}</div>
+     <div>${verdict(r.checks.root, "root = MTH(叶子[0..size)) 本地前缀根")}</div>
+     <div>${verdict(r.checks.prevLink && r.checks.headHash,
+       "prev_head_hash / head_hash 链接成立")}</div>
+     <div>${verdict(same, "重新抓取的摘要与评估时的记录逐字节一致")}</div>` +
+    (r.reasons.length
+      ? `<pre class="mono">${[...new Set(r.reasons)].map(x=>"· "+x).join("\n")}</pre>`
+      : "");
+}
+
+function renderLatest() {
+  let html = `<table><tr><th>purpose</th><th>最新版本</th><th>version_id</th>
+    <th>公开状态</th><th>指纹</th><th>叶序号</th></tr>`;
+  for (const [purpose, v] of Object.entries(STATUS.latest_by_purpose)) {
+    html += `<tr><td>${purpose}</td><td>${v.version}</td>
+      <td class="mono">${v.version_id}</td>
+      <td><span class="pill ${v.state}">${v.state}</span></td>
+      <td class="mono">${v.fingerprint}</td><td>${v.leaf_index}</td></tr>`;
+  }
+  html += `</table><div class="mono" style="margin-top:8px">待记录/过渡状态：` +
+    (STATUS.pending_events.length
+      ? STATUS.pending_events.map(e=>`${e.purpose} v${e.version}:${e.state}`).join("，")
+      : "无") + "</div>";
+  document.getElementById("latest").innerHTML = html;
+}
+function renderSplit() {
+  const el = document.getElementById("splitview");
+  if (!STATUS.splits.length) { el.innerHTML = '<span class="muted">无 split-view 事件。</span>'; return; }
+  el.innerHTML = "<table><tr><th>split</th><th>类型</th><th>状态</th><th>详情</th></tr>" +
+    STATUS.splits.map(s => `<tr><td class="mono">${s.split_id}</td>
+      <td>${s.kind}</td><td><span class="pill ${s.status}">${s.status}</span></td>
+      <td class="mono">${JSON.stringify(s.detail)}</td></tr>`).join("") + "</table>";
+}
+function renderBranches() {
+  const el = document.getElementById("branches");
+  const rejected = (STATUS.resolutions||[]).flatMap(r =>
+    r.rejected && r.rejected.root ? [[r.split_id, r.rejected, r.reason, r.decided_by]] : []);
+  let html = "";
+  if (STATUS.frozen) {
+    const d = STATUS.frozen.detail;
+    html += `<div>开放分裂 <b class="mono">${STATUS.frozen.split_id}</b>：本地 size=${d.size??d.smaller_size}
+      root=${((d.local_root ?? d.smaller_root) || "").slice(0,16)}… vs 观察到
+      ${((d.observed_root ?? d.larger_root) || "").slice(0,16)}…</div>`;
+  }
+  html += `<table><tr><th>split</th><th>被拒分支(保留为证据)</th><th>原因</th><th>操作人</th></tr>` +
+    rejected.map(([sid, rej, reason, by]) =>
+      `<tr><td class="mono">${sid}</td><td class="mono">size=${rej.size} ${(rej.root||"").slice(0,16)}…</td>
+       <td>${reason}</td><td>${by}</td></tr>`).join("") + "</table>";
+  el.innerHTML = html || '<span class="muted">无冲突分支。</span>';
+}
+function pinCurrent() {
+  if (STATUS && STATUS.head) { savePinned(STATUS.head); renderPin();
+    document.getElementById("pinned").textContent = "已固定 size=" + STATUS.head.tree_size; }
+}
+function unpin() { clearPinned(); renderPin(); document.getElementById("pinned").textContent=""; }
+
+// ---------------------------------------------------------------------------
+// inclusion: rebuild the member path in-browser and bind the accompanying
+// head into the evaluated chain (same record at the same size), so the proof
+// cannot terminate at a root from another tree.
+// ---------------------------------------------------------------------------
+async function checkInclusion() {
+  const purpose = document.getElementById("inc-purpose").value.trim();
+  const version = document.getElementById("inc-version").value.trim();
+  const vid = document.getElementById("inc-vid").value.trim();
+  const q = new URLSearchParams();
+  if (purpose) q.set("purpose", purpose);
+  if (version) q.set("version", version);
+  if (vid) q.set("version_id", vid);
+  const r = await api("/api/transparency/inclusion?" + q.toString());
+  const el = document.getElementById("incresult");
+  if (r.error) { el.innerHTML = verdict(false, r.error + " " + (r.message||"")); return; }
+  const lh = await leafHash(r.leaf);
+  const leafHashOk = hex(lh) === r.leaf_hash;
+  const root = unhex(r.head.root_hash);
+  const incOk = await verifyInclusion(r.leaf_index, r.tree_size,
+                                      r.inclusion_path, lh, root);
+  const sigOk = await verifyHeadSig(EVAL ? EVAL.pubBytes : null, r.head);
+  // bind the proof's head to the independently evaluated head at that size
+  const rec = EVAL && EVAL.heads.has(r.tree_size)
+    ? EVAL.heads.get(r.tree_size) : null;
+  const headBound = !!(rec && rec.trusted && sameHead(r.head, rec.head));
+  // and the leaf body must be a member of the shared leaf set at that index
+  const leafBound = !!(EVAL && EVAL.leaves[r.leaf_index] &&
+    hex(await leafHash(EVAL.leaves[r.leaf_index])) === hex(lh));
+  const all = leafHashOk && incOk && sigOk && headBound && leafBound;
+  el.innerHTML =
+    `<div>${trustBadge(all, "成员路径在浏览器重算成立，且锚定到已验证链上的同一摘要",
+      "成员路径未通过完整核验")}</div>
+     <div>${verdict(leafHashOk, "叶子哈希 = 0x00‖canonical(leaf) 本地重算")}</div>
+     <div>${verdict(incOk, `包含路径 idx=${r.leaf_index} size=${r.tree_size} → head 根`)}</div>
+     <div>${verdict(sigOk, "随附 head 签名有效")}</div>
+     <div>${verdict(headBound, "随附 head 即链上该高度已验证摘要（防跨树拼接）")}</div>
+     <div>${verdict(leafBound, "叶子即共享叶子序列中该序号的同一条目")}</div>
+     <pre>${JSON.stringify({purpose:r.leaf.purpose, version:r.leaf.version,
+       event:r.leaf.event, state:r.leaf.state, fingerprint:r.leaf.fingerprint,
+       audit_ref:r.leaf.audit_ref, ceremony:r.leaf.ceremony_id}, null, 1)}</pre>`;
+}
+
+// ---------------------------------------------------------------------------
+// consistency from a saved/pasted historical head: accept ONLY a real
+// extension. The old head must itself be a verified record of THIS log
+// (signature + (for an existing height) the exact stored head), and the new
+// root must be the evaluated current root; the position-bound verifier then
+// rejects truncation, reordering, early-entry rewrite and spliced proofs.
+// ---------------------------------------------------------------------------
+async function checkConsistency() {
+  const el = document.getElementById("consresult");
+  let oldSize = parseInt(document.getElementById("cons-oldsize").value.trim(), 10);
+  let oldRootHex = document.getElementById("cons-oldroot").value.trim();
+  const pasted = document.getElementById("cons-oldhead").value.trim();
+  let oldHead = null;
+  if (pasted) {
+    try { oldHead = JSON.parse(pasted); }
+    catch (e) { el.innerHTML = verdict(false, "旧 head JSON 解析失败"); return; }
+    oldSize = oldHead.tree_size; oldRootHex = oldHead.root_hash;
+  } else {
+    const pinned = loadPinned();
+    if ((!Number.isFinite(oldSize)) && pinned) { oldSize = pinned.tree_size; }
+    if (!oldRootHex && pinned && pinned.tree_size === oldSize) {
+      oldRootHex = pinned.root_hash; oldHead = pinned;
+    }
+  }
+  if (!Number.isInteger(oldSize) || oldSize < 0 || !oldRootHex) {
+    el.innerHTML = verdict(false, "需要旧树大小与旧根（或粘贴旧 head / 先固定）"); return;
+  }
+  // authenticate the anchor as a genuine head of THIS log
+  const oldSig = await verifyHeadSig(EVAL ? EVAL.pubBytes : null, oldHead);
+  let anchorOk = false, anchorNote;
+  if (!oldHead) {
+    anchorNote = "仅提供了 size+root：未对旧摘要本身做签名/链认证";
+  } else if (!wellFormedHead(oldHead) || oldHead.tree_size !== oldSize ||
+             oldHead.root_hash !== oldRootHex) {
+    anchorNote = "旧摘要字段自相矛盾";
+  } else if (oldSize > 0) {
+    const rec = EVAL.heads.get(oldSize);
+    anchorOk = !!(rec && rec.trusted && sameHead(oldHead, rec.head));
+    anchorNote = anchorOk
+      ? `旧摘要是本日志高度 ${oldSize} 已验证的存储记录`
+      : "旧摘要与本日志该高度已验证记录不一致（可能来自另一棵树）";
+  } else {
+    anchorOk = oldSig && oldRootHex === hex(emptyRootBytes());
+    anchorNote = "空树锚点";
+  }
+
+  const r = await api(`/api/transparency/consistency?old_size=${oldSize}`);
+  if (r.error) { el.innerHTML = verdict(false, r.error); return; }
+  const newRec = EVAL.heads.get(r.tree_size);
+  const newHeadBound = !!(newRec && newRec.trusted && sameHead(r.head, newRec.head));
+  const newRoot = unhex(r.head.root_hash);
+  const extOk = await verifyConsistency(oldSize, r.tree_size, r.consistency_path,
+                                        unhex(oldRootHex), newRoot);
+  const strictAppend = r.tree_size >= oldSize;
+  const accepted = extOk && strictAppend && anchorOk && newHeadBound;
+  el.innerHTML =
+    `<div>${trustBadge(accepted,
+      `合法延长确认：${oldSize} → ${r.tree_size}，旧内容完整保留且仅在尾部追加`,
+      "不是由该旧摘要延长的序列（删尾/换序/改写早期条目/跨树混合均拒绝）")}</div>
+     <div>${verdict(anchorOk, anchorNote)}</div>
+     <div>${verdict(extOk && strictAppend,
+       `严格追加（本地重算一致性路径）：${oldSize} → ${r.tree_size}`)}</div>
+     <div>${verdict(newHeadBound,
+       "新 head 即当前已验证链上的同一摘要（防跨树终点）")}</div>
+     <div>${verdict(oldSig, "旧 head 签名有效")}</div>
+     <pre class="mono">path nodes: ${r.consistency_path.length}</pre>`;
+}
+
+async function submitObserved() {
+  const el = document.getElementById("obsresult");
+  const raw = document.getElementById("obshead").value.trim();
+  let head;
+  try { head = JSON.parse(raw); }
+  catch (e) { el.innerHTML = verdict(false, "head JSON 解析失败"); return; }
+  const observer = document.getElementById("observer").value.trim() || "browser";
+  // Pre-flight in the browser: a forged attestation is untrusted input and
+  // must not be mistaken for a real log head.
+  const preSig = await verifyHeadSig(EVAL ? EVAL.pubBytes : null, head);
+  const r = await post("/api/transparency/observe", {head, observer});
+  if (r.error) {
+    el.innerHTML = verdict(false,
+      (preSig ? r.error : "伪造认证信息（签名无效），服务端已拒绝：") +
+      " " + (r.message||""));
+    refresh();
+    return;
+  }
+  el.innerHTML = (r.frozen
+    ? verdict(false, "检测到 split-view（同高度不同根/非延长），透明度发布已冻结，已保存冲突证据")
+    : verdict(true, "已记录观察，未发现分叉")) +
+    (preSig ? "" : `<div>${verdict(false,
+       "本地预检验：该 head 签名无效（伪造认证），不应视为日志真实摘要")}</div>`) +
+    `<pre class="mono">${JSON.stringify(r.split&&r.split.detail||{}, null, 1)}</pre>`;
+  refresh();
+}
+
+async function resolveSplit() {
+  const el = document.getElementById("resolve-result");
+  const token = document.getElementById("token").value.trim();
+  const splitId = document.getElementById("resolve-split").value.trim();
+  const reason = document.getElementById("resolve-reason").value.trim();
+  if (!token) { el.innerHTML = verdict(false, "需要 ROOT_OWNER 令牌"); return; }
+  if (!splitId || !reason) { el.innerHTML = verdict(false, "split_id 与原因必填"); return; }
+  // The browser only offers recovery from a provable branch: re-run the full
+  // deterministic evaluation and require the current head to be a trusted
+  // record of this log at the claimed size before asking the server to
+  // resolve. A branch that fails local recomputation is never submitted.
+  const ev = await evaluateLog();
+  if (!ev.ok || !ev.current || !ev.current.trusted) {
+    el.innerHTML = verdict(false,
+      "当前分支无法在浏览器证明为可信延长，拒绝提交恢复请求");
+    return;
+  }
+  const chosen = ev.current.head;
+  const r = await post("/api/transparency/resolve",
+    {split_id:splitId, chosen_head:chosen, reason}, token);
+  if (r.error) { el.innerHTML = verdict(false, r.error+" "+(r.message||"")); return; }
+  el.innerHTML = verdict(true,
+    `已选择本地可验证分支 size=${r.chosen_size} 并记录原因；被拒分支保留为证据`);
+  refresh();
+}
+
+// Test-harness hook: node drivers drive the page functions and read back the
+// same EVAL the UI renders. In a normal browser this is a harmless no-op.
+const KC_HOOK = {
+  refresh, evaluateLog, checkInclusion, checkConsistency, checkHistoryHead,
+  submitObserved, resolveSplit,
+  getStatus: () => STATUS, getEval: () => EVAL,
+  leafHash, verifyInclusion, verifyConsistency, verifyHeadSig, headHashHex,
+  wellFormedHead, sameHead, canonical, unhex, hex, b64ToBytes, rootOf,
+};
+if (typeof window !== "undefined") {
+  window.KC = KC_HOOK;
+} else if (typeof globalThis !== "undefined") {
+  globalThis.KC = KC_HOOK;   // node test harness
+}
+
+// A browser runs the initial load; under the node test harness there is no
+// document/localStorage, so the script stays inert until the driver calls it.
+if (typeof window !== "undefined" && typeof document !== "undefined") {
+  refresh();
+}
+</script>
+</body>
+</html>

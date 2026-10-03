@@ -1,0 +1,260 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>离线审计档案 · 增量见证汇聚台</title>
+<style>
+  body { font: 13px/1.5 -apple-system, "Segoe UI", sans-serif; margin: 0;
+         background: #f5f6f8; color: #1f2933; }
+  header { background: #10233f; color: #fff; padding: 10px 18px;
+           display: flex; gap: 18px; align-items: center; }
+  header h1 { font-size: 15px; margin: 0; font-weight: 600; }
+  .pill { background: #1d3f6b; border-radius: 12px; padding: 2px 10px;
+          font-size: 12px; }
+  main { display: grid; grid-template-columns: 1fr 1fr; gap: 14px;
+         padding: 14px; }
+  .card { background: #fff; border: 1px solid #d9dee5; border-radius: 8px;
+          padding: 12px 14px; }
+  .card h2 { font-size: 13px; margin: 0 0 8px; color: #24415f; }
+  table { border-collapse: collapse; width: 100%; font-size: 12px; }
+  th, td { border-bottom: 1px solid #eef1f4; padding: 4px 6px;
+           text-align: left; vertical-align: top; }
+  th { color: #697889; font-weight: 600; }
+  code, .mono { font-family: ui-monospace, Menlo, Consolas, monospace;
+                font-size: 11px; word-break: break-all; }
+  .iso { color: #b3261e; font-weight: 700; }
+  .ok  { color: #1e7d32; font-weight: 600; }
+  .gap { color: #b26a00; }
+  button { background: #235b9c; color: #fff; border: 0; border-radius: 5px;
+           padding: 5px 12px; font-size: 12px; cursor: pointer; }
+  button.sec { background: #5b6b7c; }
+  button.warn { background: #b26a00; }
+  textarea, input, select { width: 100%; box-sizing: border-box;
+        font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px;
+        padding: 5px; border: 1px solid #c4ccd6; border-radius: 4px; }
+  textarea { height: 120px; }
+  .row { display: flex; gap: 8px; margin-top: 6px; }
+  .row > * { flex: 1; }
+  #log { white-space: pre-wrap; background: #0f1c2e; color: #c8e1ff;
+         border-radius: 6px; padding: 8px; font-size: 11px;
+         max-height: 220px; overflow: auto; }
+  .wide { grid-column: 1 / span 2; }
+  .ver { border: 1px solid #e2e6ea; border-radius: 5px; padding: 6px;
+         margin: 4px 0; }
+  .ver.sel { border-color: #235b9c; background: #f0f5fb; }
+  .tag { display:inline-block; border-radius: 8px; padding: 0 7px;
+         font-size: 11px; margin-right: 4px; }
+  .tag.open { background: #fde7e7; color: #b3261e; }
+  .tag.res  { background: #e5f3e8; color: #1e7d32; }
+</style>
+</head>
+<body>
+<header>
+  <h1>离线审计档案 · 增量见证汇聚台</h1>
+  <span class="pill">轮次 <b id="round">–</b></span>
+  <span class="pill">门限 <b id="threshold">–</b></span>
+  <span class="pill">达标来源 <b id="eligible">–</b></span>
+  <span class="pill">未决冲突 <b id="openconf">–</b></span>
+  <span style="flex:1"></span>
+  <button class="sec" onclick="recover()">重启恢复</button>
+  <button class="warn" onclick="publish()">发布见证 (CAS)</button>
+</header>
+<main>
+  <section class="card">
+    <h2>各来源状态（缺口 / 确认位置 / 隔离）</h2>
+    <table id="srcTable">
+      <thead><tr><th>来源</th><th>确认位置</th><th>最高见到</th>
+        <th>缺口</th><th>隔离</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
+
+  <section class="card">
+    <h2>发布根（历史轮次不可改写；迟到数据进下一轮）</h2>
+    <table id="pubTable">
+      <thead><tr><th>轮次</th><th>发布时间</th><th>见证根</th>
+        <th>头(s)</th></tr></thead><tbody></tbody>
+    </table>
+  </section>
+
+  <section class="card">
+    <h2>冲突处置（解除隔离必须填写理由与决策人）</h2>
+    <div id="conflicts"></div>
+  </section>
+
+  <section class="card">
+    <h2>上传签名分段 / 注册来源 / 调整门限</h2>
+    <div class="row">
+      <input id="newSource" placeholder="新来源标识（留空 pubkey 则服务端生成并一次性返回种子）">
+      <input id="newPubkey" placeholder="pubkey(base64)，可留空">
+      <button onclick="registerSource()">注册</button>
+    </div>
+    <div class="row">
+      <input id="thrInput" type="number" min="1" placeholder="设置门限">
+      <button class="sec" onclick="setThreshold()">调整门限</button>
+    </div>
+    <div style="margin-top:8px">
+      <textarea id="segInput"
+        placeholder='粘贴一个分段对象，或 {"segments":[ ... ]} 批量上传；允许乱序、重复'></textarea>
+      <div class="row"><button onclick="upload()">上传分段</button>
+        <button class="sec" onclick="document.getElementById('segInput').value=''">清空</button>
+      </div>
+    </div>
+  </section>
+
+  <section class="card wide">
+    <h2>操作 / 观察日志（并发发布最多一个成功，失败方看到已发布根）</h2>
+    <div id="log"></div>
+  </section>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+function log(msg, obj) {
+  const line = `[${new Date().toLocaleTimeString()}] ${msg}` +
+    (obj !== undefined ? "\n" + JSON.stringify(obj, null, 1) : "");
+  $("log").textContent = line + "\n" + $("log").textContent;
+}
+async function api(path, method, body) {
+  const opt = { method, headers: {"Content-Type": "application/json"} };
+  if (body !== undefined) opt.body = JSON.stringify(body);
+  const r = await fetch(path, opt);
+  const j = await r.json();
+  if (!r.ok) throw Object.assign(new Error(j.error || r.status), {resp: j});
+  return j;
+}
+const short = (s) => s ? s.slice(0, 12) + "…" + s.slice(-6) : s;
+
+async function refresh() {
+  const s = await api("/api/archive/status", "GET");
+  $("round").textContent = s.current_round;
+  $("threshold").textContent = s.threshold;
+  $("eligible").textContent =
+    `${s.eligible_count}` + (s.eligible_count >= s.threshold ? " ✓" : " ✗");
+  $("openconf").textContent = s.open_conflicts.length;
+
+  const tb = $("srcTable").querySelector("tbody");
+  tb.innerHTML = "";
+  for (const [sid, x] of Object.entries(s.sources)) {
+    const gaps = x.gaps.length
+      ? x.gaps.map(g => `<span class="gap">#${g.seq}(${g.reason})</span>`)
+                    .join(" ")
+      : '<span class="ok">连续</span>';
+    tb.insertAdjacentHTML("beforeend",
+      `<tr><td><div class="mono">${sid}</div>
+        <div class="mono">${short(x.last_confirmed_digest)}</div></td>
+       <td>${x.last_confirmed_seq}</td>
+       <td>${x.highest_seen_seq}</td><td>${gaps}</td>
+       <td class="${x.isolated ? 'iso' : 'ok'}">
+         ${x.isolated ? "已隔离" : "正常"}</td></tr>`);
+  }
+
+  const pb = $("pubTable").querySelector("tbody");
+  pb.innerHTML = "";
+  for (const m of s.publications) {
+    pb.insertAdjacentHTML("beforeend",
+      `<tr><td>${m.round}</td><td>${m.published_at}</td>
+       <td class="mono">${m.root}</td>
+       <td class="mono">${m.heads.map(h =>
+         `${h.source}@${h.seq}`).join("<br>")}</td></tr>`);
+  }
+
+  const box = $("conflicts");
+  box.innerHTML = "";
+  const list = Object.values(s.conflicts);
+  if (!list.length) box.innerHTML = '<p class="ok">无冲突记录。</p>';
+  for (const c of list) {
+    const tag = c.status === "OPEN"
+      ? '<span class="tag open">OPEN</span>'
+      : '<span class="tag res">RESOLVED</span>';
+    const vers = c.versions.map((v, i) => `
+      <div class="ver" id="ver-${c.conflict_id}-${i}">
+        <b>版本 ${i+1}</b> <span class="mono">${v.digest}</span><br>
+        prev=<span class="mono">${short(v.prev)}</span>
+        payload=<span class="mono">${short(v.payload_digest)}</span><br>
+        <small>首次见到 ${v.first_seen}</small>
+      </div>`).join("");
+    let dec = "";
+    if (c.status === "OPEN") {
+      dec = `
+        <select id="acc-${c.conflict_id}">
+          ${c.versions.map((v, i) =>
+            `<option value="${v.digest}">接受版本 ${i+1}
+             (${short(v.digest)})</option>`).join("")}
+        </select>
+        <input id="why-${c.conflict_id}" placeholder="人工理由（必填）">
+        <input id="by-${c.conflict_id}" placeholder="决策人（必填）">
+        <button onclick="resolve('${c.conflict_id}')">提交决策</button>`;
+    } else {
+      dec = `<small>接受 <span class="mono">${short(
+          c.decision.accepted_digest)}</span>；理由：${c.decision.reason}
+        ；决策人：${c.decision.decided_by}；${
+          c.decision.rejected_digests.length} 个版本保留在证据中</small>`;
+    }
+    box.insertAdjacentHTML("beforeend",
+      `<div class="ver">
+        ${tag} <b>${c.source}</b> @ seq ${c.seq_id ?? c.seq}
+        <small>(${c.conflict_id}, ${c.created_at})</small>
+        ${vers}${dec}</div>`);
+  }
+}
+
+async function registerSource() {
+  try {
+    const body = {source: $("newSource").value.trim()};
+    if ($("newPubkey").value.trim()) body.pubkey = $("newPubkey").value.trim();
+    const r = await api("/api/archive/sources", "POST", body);
+    log("注册来源", r);
+    if (r.seed) alert("该来源种子仅显示一次：\n" + r.seed);
+    refresh();
+  } catch (e) { log("注册失败: " + e.message, e.resp); }
+}
+async function setThreshold() {
+  try {
+    const r = await api("/api/archive/threshold", "POST",
+      {threshold: parseInt($("thrInput").value, 10)});
+    log("门限已更新", r); refresh();
+  } catch (e) { log("门限更新失败: " + e.message, e.resp); }
+}
+async function upload() {
+  try {
+    let body;
+    const txt = $("segInput").value.trim();
+    const parsed = JSON.parse(txt);
+    body = Array.isArray(parsed) ? {segments: parsed}
+         : parsed.segments ? parsed : parsed;
+    const r = await api("/api/archive/segments", "POST", body);
+    log(`上传完成（${r.results.length} 条，伪造签名 ${
+        r.bad_signatures} 条）`, r);
+    refresh();
+  } catch (e) { log("上传失败: " + e.message, e.resp); }
+}
+async function recover() {
+  try { log("从检查点恢复…", await api("/api/archive/recover", "POST", {}));
+        refresh(); }
+  catch (e) { log("恢复失败: " + e.message, e.resp); }
+}
+async function resolve(cid) {
+  try {
+    const r = await api("/api/archive/conflicts/resolve", "POST", {
+      conflict_id: cid,
+      accepted_digest: $(`acc-${cid}`).value,
+      reason: $(`why-${cid}`).value,
+      by: $(`by-${cid}`).value,
+    });
+    log("冲突已处置（后续链已重新验证）", r); refresh();
+  } catch (e) { log("处置失败: " + e.message, e.resp); }
+}
+async function publish() {
+  try {
+    const r = await api("/api/archive/publish", "POST", {});
+    log(r.race_lost ? "发布竞争失败，返回已发布根" : "发布成功",
+        r.manifest);
+  } catch (e) { log("发布被拒绝: " + e.message, e.resp); }
+  refresh();
+}
+refresh();
+setInterval(refresh, 3000);
+</script>
+</body>
+</html>
