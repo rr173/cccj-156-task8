@@ -99,15 +99,15 @@ APPROVER_DUTIES: dict[str, frozenset[str]] = {
 READ_SCOPES: dict[str, frozenset[str]] = {
     P.ROOT_OWNER: frozenset(
         {"keys", "ceremonies", "policies", "participants",
-         "audit", "export", "tickets", "sessions", "drills"}),
+         "audit", "export", "tickets", "sessions", "drills", "budgets"}),
     P.KEY_STEWARD: frozenset(
         {"keys", "ceremonies", "policies", "participants", "tickets",
-         "drills"}),
+         "drills", "budgets"}),
     P.WITNESS_SHAREHOLDER: frozenset(
         {"keys", "ceremonies", "policies", "participants",
-         "audit", "export", "tickets", "drills"}),
+         "audit", "export", "tickets", "drills", "budgets"}),
     P.ENCLAVE_OPERATOR: frozenset(
-        {"keys", "ceremonies", "policies", "tickets", "drills"}),
+        {"keys", "ceremonies", "policies", "tickets", "drills", "budgets"}),
 }
 CAPABILITIES: dict[str, frozenset[str]] = {
     P.ROOT_OWNER: frozenset({
@@ -117,12 +117,16 @@ CAPABILITIES: dict[str, frozenset[str]] = {
         "drill:plan", "drill:scan", "drill:run", "drill:mirror",
         "drill:lease", "drill:failback", "drill:terminate",
         "transparency:resolve",
+        # verifiable signing-usage budgets: the security lead issues sheets,
+        # revises/pauses/resumes them and handles long-hung reservations.
+        "budget:admin", "budget:handle",
     }),
     P.KEY_STEWARD: frozenset({
         "ceremony:open", "device:step", "sign:use",
         "ticket:create", "ticket:approve", "ticket:withdraw",
         "drill:plan", "drill:scan", "drill:run", "drill:mirror",
         "drill:failback", "drill:terminate",
+        "budget:handle",
     }),
     P.WITNESS_SHAREHOLDER: frozenset({
         "device:step",
@@ -134,6 +138,7 @@ CAPABILITIES: dict[str, frozenset[str]] = {
         "ticket:create", "ticket:approve", "ticket:withdraw",
         "drill:plan", "drill:scan", "drill:run", "drill:mirror",
         "drill:failback", "drill:terminate",
+        "budget:handle",
     }),
 }
 

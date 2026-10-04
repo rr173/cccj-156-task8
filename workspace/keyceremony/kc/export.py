@@ -81,6 +81,24 @@ def build_bundle(orch, sessions=None, authz_mod=None) -> dict:
         "drill_evidence": list(s.get("drill_evidence", {}).values()),
         "drill_regions": dict(s.get("drill_regions", {})),
         "transparency": _transparency_section(orch),
+        # verifiable signing-usage budgets: officer identities, subjects,
+        # sheets with revision chain, every reservation with its credential,
+        # signatures audit and consumption/return records (public fields only)
+        "budget_officers": [
+            {"officer_id": oid, "pub": r.get("pub"), "label": r.get("label"),
+             "registered_at": r.get("registered_at")}
+            for oid, r in s.get("budget_officers", {}).items()],
+        "budget_subjects": dict(s.get("budget_subjects", {})),
+        "budgets": [
+            {k: b.get(k) for k in (
+                "id", "purpose", "key_version_id", "subject", "revision",
+                "status", "total", "per_batch_cap", "effective_at",
+                "deadline", "lease_seconds", "label", "issued_by",
+                "created_at", "updated_at", "superseded_by",
+                "revision_chain")}
+            for b in s.get("budgets", {}).values()],
+        "budget_reservations": _public_reservations(
+            s.get("budget_reservations", {})),
     }
     body["invariants"] = {
         "body_hash_excluding_sig": crypto.digest_hex(
@@ -92,6 +110,8 @@ def build_bundle(orch, sessions=None, authz_mod=None) -> dict:
         "n_sessions": len(body["sessions"]),
         "n_drills": len(body["drills"]),
         "n_drill_evidence": len(body["drill_evidence"]),
+        "n_budgets": len(body["budgets"]),
+        "n_budget_reservations": len(body["budget_reservations"]),
     }
     sig = ed25519.sign(orch.seed,
                        body["invariants"]["body_hash_excluding_sig"].encode())
@@ -104,6 +124,29 @@ def _public_session(r: dict) -> dict:
             "quote_ts", "created_at", "expires_at", "status", "closed_at",
             "superseded_at")
     return {k: r[k] for k in keep if k in r}
+
+
+def _public_reservations(res: dict) -> list[dict]:
+    """Reservation records for the verifiable archive: credentials, the
+    signature audit (message/sig digests only - never raw signatures as
+    authority, they are public Ed25519 signatures anyway), and settlement."""
+    out = []
+    for r in res.values():
+        out.append({
+            "id": r["id"], "request_id": r["request_id"],
+            "budget_id": r["budget_id"], "purpose": r["purpose"],
+            "key_version_id": r["key_version_id"], "subject": r["subject"],
+            "amount": r["amount"], "consumed_amount": r["consumed_amount"],
+            "status": r["status"], "reserved_at": r["reserved_at"],
+            "lease_expires_at": r["lease_expires_at"],
+            "lease_seconds": r["lease_seconds"],
+            "signatures": r.get("signatures", []),
+            "settlement": r.get("settlement"),
+            "settled_at": r.get("settled_at"),
+            "credential": r.get("credential"),
+            "manual_handling": r.get("manual_handling"),
+        })
+    return out
 
 
 def _public_key(k: dict) -> dict:
@@ -362,6 +405,17 @@ def verify_bundle(bundle: dict) -> dict:
     checks["transparency_leaves"] = tv["n_leaves"]
     for f in tv["findings"]:
         problems.append(f"transparency: {f['code']} {f['message']}")
+
+    # 10. verifiable signing-usage budgets: replay every quantity change from
+    # the audit chain (forged sheet, double spend, over-quota, cross-subject,
+    # window/revision regression, signed-release, sig<->settlement mismatch)
+    from .budget_verify import verify_budgets
+    bv = verify_budgets(bundle)
+    checks["budgets_ok"] = bv["ok"]
+    checks["budget_findings"] = bv["checks"]["n_findings"]
+    for fnd in bv["findings"]:
+        problems.append(
+            f"budget: {fnd['code']} {fnd['message']} (audit seq {fnd['seq']})")
 
     return {"ok": not problems, "problems": problems, "checks": checks}
 

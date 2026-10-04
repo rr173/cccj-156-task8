@@ -227,3 +227,79 @@ class EvidenceError(CeremonyError):
         self.problems = problems or []
         super().__init__("; ".join(self.problems) or self.__class__.__doc__,
                          code)
+
+
+# ---------------------------------------------------------------------------
+# verifiable signing-usage budgets
+# ---------------------------------------------------------------------------
+
+class BudgetError(CeremonyError):
+    code = "BUDGET_ERROR"
+    http_status = 409
+
+
+class BudgetNotFound(NotFound):
+    code = "BUDGET_NOT_FOUND"
+
+
+class BudgetExhausted(BudgetError):
+    """Not enough free quota: consumed + valid reservations would exceed the
+    budget total once this reservation were granted."""
+
+    code = "BUDGET_EXHAUSTED"
+
+
+class BudgetPaused(BudgetError):
+    """New reservations are refused while the budget is paused."""
+
+    code = "BUDGET_PAUSED"
+
+
+class BudgetWindowClosed(BudgetError):
+    """New reservations are refused outside the budget time window."""
+
+    code = "BUDGET_WINDOW_CLOSED"
+
+
+class SubjectRevoked(BudgetError):
+    """The calling subject of this budget has been revoked."""
+
+    code = "SUBJECT_REVOKED"
+
+
+class KeyVersionRetired(BudgetError):
+    """The budget's key version has been retired/destroyed; no new signing."""
+
+    code = "KEY_VERSION_RETIRED"
+
+
+class ReservationExpired(BudgetError):
+    """The short reservation lease has lapsed; settle or re-reserve."""
+
+    code = "RESERVATION_EXPIRED"
+
+
+class ReservationState(BudgetError):
+    """The reservation is not in the state this action requires."""
+
+    code = "RESERVATION_STATE"
+
+
+class ReservationHasSignature(BudgetError):
+    """A reservation carrying signature audit may never be released."""
+
+    code = "RESERVATION_HAS_SIGNATURE"
+
+
+class BudgetCredentialInvalid(BudgetError):
+    """The presented reservation credential signature does not verify."""
+
+    code = "BUDGET_CREDENTIAL_INVALID"
+    http_status = 401
+
+
+class BudgetRevisionConflict(RevisionConflict):
+    """A newer budget revision exists; the stale edit is rejected with the
+    current revision and both sides' quantities (never overwritten)."""
+
+    code = "BUDGET_REVISION_CONFLICT"

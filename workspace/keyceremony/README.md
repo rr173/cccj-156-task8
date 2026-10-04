@@ -227,8 +227,64 @@ python -m kc.transparency_cli verify ./export/export.json
 
 ---
 
+## 1f. 签名入口的可核验用量预算（保留 / 签名审计 / 结算消费 / 短租约）
 
-## 2. 目录结构
+为签名入口加入**可核验的用量预算**。安全负责人按「用途 + 密钥版本」签发
+预算单，写明调用主体、可签次数（总量）、单批上限、生效时间与截止时间；
+预算单带**递增修订号**并由登记在案的负责人 Ed25519 签名。受控用途的签名
+走显式两阶段协议，未受治理（无预算单）的用途继续按原方式签名。新能力位于
+独立模块（`kc/budgets.py`、`kc/budget_verify.py`、`kc/budget_cli.py`、
+`kc/budgets.html`），状态并入同一份加锁 `state.json`，全部数量变化进入既有
+哈希链 + 服务签名审计。
+
+```
+保留额度 reserve(唯一请求号, 短租约)
+   → 产出签名 sign-reserved（先写签名摘要审计）
+   → 结算 settle（保留结算为消费；未用单位归还）
+```
+
+| 需求 | 实现方式 |
+|---|---|
+| **预算单要素** | `{purpose, key_version_id, subject, total, per_batch_cap, effective_at, deadline, lease_seconds}`，签发即修订号 1，负责人对规范化字段签名（`budget-issue-v1`），审计逐字段留存可独立重算签名。 |
+| **先保留再签名再结算** | `reserve` 校验暂停/主体撤销/密钥退役/时间窗/单批上限后，在存储锁内检查 `消费+有效保留+本次 ≤ 总量` 才记账，并颁发绑定请求号/预算/主体/数量/租期的**保留凭据**（服务身份 Ed25519 签名）。签名经 `sign-reserved` 在结算**之前**逐条写入 `{消息摘要, 密钥版本, 签名摘要}` 审计；`settle` 的消费量必须等于签名审计条数，凭空声明消费被拒。 |
+| **相同请求号幂等** | `request_id` 全局唯一；重复提交直接返回**第一次**的保留、签名摘要与结算记录（`duplicate:true`），绝不二次消费。 |
+| **最后额度争抢** | 全部保留/签名/结算都在跨线程 RLock + 跨进程 flock 的同一把锁内“读最新→校验→落盘”。8 线程 / 6 进程争抢 1~2 个名额时恰好满足名额者成功，其余 `409 BUDGET_EXHAUSTED`，已结算与仍保留之和永不越界。 |
+| **短租约 + 接管判断** | 保留有 `lease_seconds` 租期。接管者 `takeover(request_id)` 依据**签名审计**判定：已产出签名→额度不可复用（租约到期则自动结算为消费）；租约内无签名→可继续；过期且无签名→安全归还（RELEASED），额度立即可用。 |
+| **已签名不可释放** | 人工/过期归还任何带签名审计的保留一律 `409 RESERVATION_HAS_SIGNATURE`，只能结算；无签名的过期/悬挂保留才可释放。 |
+| **递增修订号 / 缩减下限** | 每次修订、暂停、恢复都把修订号 +1。修订前先结算过期保留，缩减后 `total` 不得小于 `已消费 + 有效保留`，否则 422。 |
+| **两个管理员并发修订** | 提交带 `base_revision`；落后者收到 `409 BUDGET_REVISION_CONFLICT`，载荷含基线/当前修订号与双方总量、可用、保留、消费及 `total_delta`，**绝不覆盖较新决定**。 |
+| **四类新保留拒绝** | 预算暂停（`BUDGET_PAUSED`）、调用主体被撤销（`SUBJECT_REVOKED`）、密钥版本退役/销毁（`KEY_VERSION_RETIRED`）、时间窗外（`BUDGET_WINDOW_CLOSED`）。但已产出的历史签名继续 `verify` 验真（RETIRING/DESTROYED 公钥永久保留）。 |
+| **无预算用途兼容** | 某用途的 ACTIVE 版本没有任何治理预算单时，`/api/sign` 与库 `sign()` 行为不变，并写一条显式 `budget_exempt_signature(governance=exempt)` 审计，使“有签名却无预算结算”可被区分为合法豁免。 |
+| **控制台/网络展示** | `/budgets` 页面与 `/api/budgets`、`/api/budgets/<id>`、`/api/reservations/<id>` 展示总量、可用、保留、消费、租期、时间窗与每请求结算状态；支持创建、修订、暂停、恢复及人工处理悬挂保留。 |
+| **人工处理留痕** | 归还/结算悬挂保留必须给理由；记录 `{operator, reason, 处理前数量, 处理后数量}`，且不能释放已有签名审计的请求。 |
+| **可验证档案** | 导出包新增 `budget_officers/budget_subjects/budgets(含 revision_chain)/budget_reservations(含凭据、签名摘要、消费或归还记录)`。 |
+| **独立检查器** | `kc.budget_verify.verify_budgets` 只信审计链，重放每次数量变化，检出：伪造预算（`FORGED_BUDGET`）、重复消费（`DUPLICATE_CONSUMPTION`）、超额签名（`OVER_QUOTA_SIGNATURE`）、跨主体挪用（`CROSS_SUBJECT_MISAPPROPRIATION`）、过期/暂停后保留（`RESERVED_AFTER_WINDOW`）、修订号回退（`REVISION_REGRESSION`）、释放已有签名的保留（`RELEASED_SIGNED_RESERVATION`）、只有消费没有签名（`CONSUMPTION_WITHOUT_SIGNATURE`）、有签名却没有预算结算（`SIGNATURE_WITHOUT_SETTLEMENT`）、凭据伪造（`RESERVATION_CREDENTIAL_BAD`）、缩减越下限（`BUDGET_TOTAL_FLOOR_BREACHED`）、治理用途伪装豁免（`EXEMPT_WHILE_GOVERNED`）、撤销主体/退役版本后保留。导出包整体校验新增 `budgets_ok`。 |
+
+受控签名接口（HTTP 层按既有会话/职责门禁；库直调不加门禁，与既有设计一致）：
+
+```
+POST /api/budget/reserve         {purpose, subject?, request_id, amount}
+POST /api/budget/sign            {request_id, message | messages[]}
+POST /api/budget/settle          {request_id, signed_count?}
+POST /api/budget/sign-governed   {purpose, subject?, request_id, message}  # 一次完成三步
+POST /api/budget/takeover        {request_id}                              # 接管判定
+POST /api/budget/reservations/release       {request_id, reason}           # 仅无签名
+POST /api/budget/reservations/settle-hung   {request_id, reason}           # 有签名
+POST /api/budget/budgets                     # 签发（budget:admin，负责人签名）
+POST /api/budget/budgets/{id}/revise|pause|resume   # base_revision 乐观并发
+POST /api/budget/officers|subjects   /api/budget/subjects/revoke
+GET  /api/budgets  /api/budgets/{id}[/reservations]  /api/reservations/{id}
+```
+
+`budget:admin`（签发/修订/暂停/恢复/主体与负责人登记）仅 ROOT_OWNER；
+`budget:handle`（人工处理悬挂保留）授予 owner/steward/operator；四职均可读
+`budgets` 视图，witness 据此独立监督。命令行见 `python3 -m kc.budget_cli`
+（`gen-officer / register-officer / register-subject / issue / revise / pause /
+resume / status / requests / release / settle-hung / verify`）。
+
+---
+
+
 
 ```
 kc/
@@ -252,6 +308,13 @@ kc/
   transparency_verify.py 独立检查器：重算全部根/证明/head 链/生命周期/双根/未登记激活
   transparency_cli.py 独立检查命令行（verify export.json|section.json）
   transparency.html 透明度管理页面：浏览器侧 Web Crypto + 纯 JS Ed25519 自行验算
+  budgets.py      签名用量预算：负责人签名预算单、递增修订链、短租约保留、
+                  两阶段签名/结算、过期接管、人工处理、消费+保留≤总量不变量
+  budget_verify.py 预算独立检查器：重放每次数量变化，检出伪造/双花/超额/跨主体/
+                  窗外保留/修订回退/签名后释放/消费无签名/签名无结算等
+  budget_cli.py   预算命令行（gen-officer/issue/revise/pause/resume/status/
+                  requests/release/settle-hung/verify）
+  budgets.html    预算控制台 UI（总量/可用/保留/消费/租期/每请求结算、修订与人工处理）
   sessions.py     终端证明登录：挑战/报价、绑定人员·职责·终端·时效的会话令牌
   authz.py        四眼授权单：冻结摘要/截止、互补职责矩阵、决策链、单次执行
   console.py      设备侧代理：证明→取件→验份额→签名确认
@@ -275,6 +338,12 @@ tests/
                       业务去重、矛盾状态/换钥阻止 head、多进程单序并发、四类中断
                       原子前滚/回滚、split-view 冻结/冻结期阻断激活/处置恢复/重启保留、
                       嵌入编排器两代证明与多次变更一致性、独立检查器 10 类检出）
+  test_budgets.py     29 个用量预算场景（连续耗尽、线程/进程最后额度争抢、请求号幂等、
+                      签名后崩溃接管与强制结算、未签名过期归还、人工处理留痕、缩减下限
+                      与并发修订冲突、暂停恢复、旧版本验真、无预算兼容、完整档案与
+                      11 类篡改档案检出）
+  budget_http_e2e.py  预算 HTTP 全流程（门禁、两阶段受控签名、幂等、争抢、修订冲突、
+                      暂停恢复、悬挂保留人工处理、旧版验真、无预算豁免、档案核验）
   http_e2e.py         HTTP 全流程含登录门禁、四类授权单、6 路并发批准、库直调不受限
   drill_http_e2e.py   演练 HTTP 全流程（区域/修订/扫描/续跑/镜像/冻结/租约/受阻清理/证据）
   transparency_http_e2e.py 透明度 HTTP 全流程（公开证明、node 执行页面 JS 浏览器侧验算、
@@ -380,7 +449,13 @@ single_active_per_purpose / handover_consistent`。
 | POST | `/api/ceremonies/{id}/commit` | 法定人数齐备后提交（DESTROY 走 PURGE_RETIRED 授权单） |
 | POST | `/api/ceremonies/{id}/publish` | **已改为四眼**：PUBLISH_GENERATION 授权单批准时执行 CAS |
 | POST | `/api/ceremonies/{id}/abort` | **已改为四眼**：ABORT_ACTIVE 授权单 |
-| POST | `/api/sign` `/api/verify` | 签名测试接口（签名按职责放行） |
+| POST | `/api/sign` `/api/verify` | 签名测试接口（无预算用途按旧方式；有预算用途需走两阶段） |
+| POST | `/api/budget/reserve` `/api/budget/sign` `/api/budget/settle` | 用量预算两阶段：保留 → 签名（写审计）→ 结算消费 |
+| POST | `/api/budget/sign-governed` `/api/budget/takeover` | 一次完成三步的受控签名 / 崩溃后接管判定 |
+| POST | `/api/budget/reservations/release` `/settle-hung` | 人工处理悬挂保留（留操作者/理由/前后数量；不释放已签名） |
+| POST | `/api/budget/budgets` `/api/budget/budgets/{id}/revise\|pause\|resume` | 签发/修订（base_revision 乐观并发）/暂停/恢复预算（budget:admin） |
+| POST | `/api/budget/officers` `/api/budget/subjects` `/api/budget/subjects/revoke` | 负责人登记 / 调用主体登记与撤销 |
+| GET | `/api/budgets` `/api/budgets/{id}` `/api/reservations/{id}` | 预算总量/可用/保留/消费/租期/时间窗与每请求结算状态 |
 | GET | `/api/keys` `/api/ceremonies` `/api/audit` `/api/export` | 只读视图（审计/导出仅 owner、witness） |
 
 > 注意：这些门禁只在 HTTP 层。直接使用 `Orchestrator`（库）时，
@@ -417,12 +492,13 @@ Feldman VSS 逐份验证、安全素数群子群一致性）。生产部署时�
 
 ```bash
 python3 tests/smoke_e2e.py
-python3 -m unittest tests.test_ceremonies tests.test_edge tests.test_authz tests.test_drills tests.test_archive tests.test_transparency -v
+python3 -m unittest tests.test_ceremonies tests.test_edge tests.test_authz tests.test_drills tests.test_archive tests.test_transparency tests.test_budgets -v
 python3 tests/http_e2e.py 8211          # 登录门禁 + 四类四眼授权单 + 6 路并发批准 + 库直调
 python3 tests/drill_http_e2e.py 8212    # 跨区域灾备演练 HTTP 全流程
 python3 tests/transparency_http_e2e.py 8213  # 透明度证明/浏览器验算/split 冻结处置
+python3 tests/budget_http_e2e.py 8215   # 用量预算：保留/签名/结算/修订/人工/档案
 # 或一次跑完：
-./run_tests.sh 8301 8302 8303
+./run_tests.sh 8301 8302 8303 8304 8305
 ```
 
 ## 12. 一次四眼操作的示例（发布新代）

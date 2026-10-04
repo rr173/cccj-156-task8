@@ -22,6 +22,7 @@ Guarantees implemented in this module
 
 from __future__ import annotations
 
+import hashlib
 import os
 import time
 
@@ -82,6 +83,11 @@ class Orchestrator:
         self.tlog = TransparencyLog(
             service_seed=self.seed, state=self.state, clock=clock,
             embedded=True)
+        # Verifiable signing-usage budgets. Purposes without a sheet are
+        # unaffected: sign()/sign_governed() fall back to legacy signing.
+        from .budgets import BudgetManager
+        self.budgets = BudgetManager(
+            self.state, self.audit, self.seed, keydir=self.dir, clock=clock)
 
     # ======================================================================
     # enrollment / policy
@@ -908,11 +914,118 @@ class Orchestrator:
     # signing test interface
     # ======================================================================
     def sign(self, purpose: str, message: bytes) -> dict:
-        sig, kv = self.dir.sign_purpose(purpose, message)
+        """Signing entry point. If the ACTIVE version of this purpose has any
+        governing budget sheet, signing requires a held reservation; callers
+        use sign_governed/reserve_signing/sign_reserved. With no budget sheet
+        the purpose keeps signing exactly as before (an `exempt` audit record
+        marks the absence of a budget at signing time)."""
+        kv = self.dir.active(purpose)
+        if kv is None:
+            raise NotFound(f"no ACTIVE key for purpose {purpose}")
+        if self.budgets.governing_budget(purpose, kv["id"]) is not None:
+            from .errors import PolicyViolation as _PV
+            raise _PV(
+                f"purpose {purpose} is governed by a usage budget; sign via "
+                f"reserve -> sign-reserved -> settle (or sign_governed)")
+        sig = self.dir.signer_sign(kv["id"], message)
+        self._audit_exempt_signature(kv, message, sig)
         return {"purpose": purpose, "version_id": kv["id"],
                 "version": kv["version"], "status": kv["status"],
                 "fingerprint": kv["fingerprint"],
-                "sig": crypto.b64e(sig)}
+                "sig": crypto.b64e(sig), "budget_governed": False}
+
+    def _audit_exempt_signature(self, kv: dict, message: bytes, sig: bytes):
+        """Record a signature made with no governing budget, explicitly
+        marked exempt so the offline checker can prove 'signature without
+        budget settlement' was legitimate rather than smuggled consumption."""
+        self.audit.append("budget_exempt_signature", {
+            "purpose": kv["purpose"], "key_version_id": kv["id"],
+            "governance": "exempt",
+            "message_digest": hashlib.sha256(message).hexdigest(),
+            "sig_digest": hashlib.sha256(sig).hexdigest(),
+            "ts": _now(self.clock)})
+
+    def reserve_signing(self, *, purpose: str, subject: str, request_id: str,
+                        amount: int = 1, actor: str = "") -> dict:
+        """Phase 1: acquire a short-lease quota reservation with a unique
+        request number."""
+        return self.budgets.reserve(
+            purpose=purpose, subject=subject, request_id=request_id,
+            amount=amount, actor=actor)
+
+    def sign_reserved(self, request_id: str, messages) -> dict:
+        """Phase 2: produce signature(s) under a live reservation. Each
+        signature is audit-recorded (message/sig digests) before settlement,
+        so produced signatures can never be released."""
+        if isinstance(messages, (bytes, bytearray)):
+            messages = [bytes(messages)]
+        else:
+            messages = [m if isinstance(m, bytes) else m.encode()
+                        for m in messages]
+
+        def sign_fn(version_id, msg):
+            return self.dir.signer_sign(version_id, msg)
+
+        view = self.budgets.sign_under_fn(request_id, messages, sign_fn)
+        raw = view.pop("signatures_raw")
+        r = self.budgets.get_reservation(request_id)
+        kv = self.dir.get(r["key_version_id"])
+        out = dict(view)
+        out["signatures_b64"] = [crypto.b64e(s) for s in raw]
+        out["version_id"] = kv["id"]
+        out["version"] = kv["version"]
+        out["fingerprint"] = kv["fingerprint"]
+        return out
+
+    def settle_signing(self, request_id: str,
+                       signed_count: int | None = None) -> dict:
+        """Phase 3: settle the reservation into consumption (unused units
+        return). Re-submitting a settled request replays the first record."""
+        r = self.budgets.get_reservation(request_id)
+        if r["status"] in ("CONSUMED", "RELEASED"):
+            return self.budgets.reservation_view(r) | {"duplicate": True}
+        return self.budgets.settle(request_id, signed_count)
+
+    def sign_governed(self, *, purpose: str, subject: str, request_id: str,
+                      message, amount: int | None = None,
+                      actor: str = "") -> dict:
+        """Convenience one-call governed signing: reserve -> sign -> settle
+        inside the same lock, preserving the two-phase audit trail. Replaying
+        a request_id returns the original signature + settlement."""
+        if isinstance(message, (bytes, bytearray)):
+            messages = [bytes(message)]
+        else:
+            messages = [message.encode()]
+        existing = self.state["budget_reservations"].get(request_id)
+        if existing is not None:
+            return self._governed_replay(existing)
+        self.reserve_signing(purpose=purpose, subject=subject,
+                             request_id=request_id,
+                             amount=amount or len(messages), actor=actor)
+        self.sign_reserved(request_id, messages)
+        self.settle_signing(request_id)
+        return self._governed_replay(
+            self.state["budget_reservations"][request_id], duplicate=False)
+
+    def _governed_replay(self, r: dict, *, duplicate: bool = True) -> dict:
+        view = self.budgets.reservation_view(r)
+        kv = self.dir.get(r["key_version_id"])
+        out = dict(view)
+        out["duplicate"] = duplicate
+        out["purpose"] = r["purpose"]
+        out["reservation_status"] = r["status"]
+        out["version_id"] = kv["id"]
+        out["version"] = kv["version"]
+        out["key_status"] = kv["status"]
+        out["fingerprint"] = kv["fingerprint"]
+        # concrete raw signatures are not retained in the archive; the replay
+        # returns the first signature digests + settlement record, exactly as
+        # required for identical request numbers. Verification of the actual
+        # Ed25519 signature needs the value the caller kept from the first
+        # response; historical verify stays available independently.
+        out["sig_digests"] = [s["sig_digest"] for s in r["signatures"]]
+        out["budget_governed"] = True
+        return out
 
     def verify(self, purpose: str, message: bytes, sig_b64: str) -> dict:
         sig = crypto.b64d(sig_b64)

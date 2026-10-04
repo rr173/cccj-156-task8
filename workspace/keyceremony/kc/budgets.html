@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>签名用量预算控制台</title>
+<style>
+  body { font: 14px/1.5 -apple-system, "Segoe UI", sans-serif; margin: 24px;
+         color: #1a2330; background:#f6f7f9; }
+  h1 { font-size: 20px; } h2 { font-size: 16px; margin-top: 28px; }
+  table { border-collapse: collapse; width: 100%; background:#fff;
+          box-shadow: 0 1px 2px rgba(0,0,0,.06); }
+  th, td { border: 1px solid #dde1e7; padding: 6px 9px; text-align:left;
+           font-size: 13px; vertical-align: top; }
+  th { background:#eef1f5; }
+  .ok { color:#0a7d38; font-weight:600; }
+  .bad { color:#b3261e; font-weight:600; }
+  .muted { color:#68707b; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:10px;
+          font-size:12px; }
+  .ACTIVE { background:#e3f4ea; color:#0a7d38; }
+  .PAUSED { background:#fdeede; color:#9a5b06; }
+  .CONSUMED { background:#e7eefc; color:#1d4fbf; }
+  .RELEASED { background:#eee; color:#555; }
+  .HELD, .SIGNED { background:#fdf3d7; color:#8a6100; }
+  input, button { font: inherit; padding:4px 8px; margin:2px; }
+  button { cursor:pointer; }
+  .card { background:#fff; border:1px solid #dde1e7; border-radius:8px;
+          padding:14px 16px; margin:12px 0; }
+  code { background:#f0f2f5; padding:1px 5px; border-radius:4px; }
+  pre { white-space: pre-wrap; word-break: break-all; background:#111827;
+        color:#e5e7eb; padding:10px; border-radius:6px; font-size:12px; }
+</style>
+</head>
+<body>
+<h1>签名用量预算控制台</h1>
+<p class="muted">
+  安全负责人按用途 + 密钥版本签发预算单。签名流程为
+  <code>保留额度 → 产出签名 → 结算消费</code>。
+  同一请求号重放返回首次签名与结算；短租约过期且无签名的保留自动归还，
+  已有签名审计的保留不可释放。
+</p>
+
+<div class="card">
+  <label>服务地址 <input id="base" value="" size="22"></label>
+  <label>会话令牌 <input id="tok" size="40" placeholder="Bearer token"></label>
+  <button onclick="load()">刷新</button>
+  <span id="summary" class="muted"></span>
+</div>
+
+<h2>预算单（总量 / 可用 / 保留 / 消费 / 租期 / 时间窗）</h2>
+<table>
+  <thead><tr>
+    <th>预算单</th><th>修订</th><th>状态</th><th>用途/密钥/主体</th>
+    <th>总量</th><th>可用</th><th>保留</th><th>消费</th>
+    <th>单批上限</th><th>租期(s)</th><th>生效~截止</th><th>操作</th>
+  </tr></thead>
+  <tbody id="budgets"></tbody>
+</table>
+
+<h2>每个请求的保留与结算状态</h2>
+<table>
+  <thead><tr>
+    <th>请求号</th><th>预算</th><th>主体</th><th>状态</th>
+    <th>数量</th><th>已消费</th><th>签名数</th>
+    <th>保留时间</th><th>租约到期</th><th>结算</th><th>人工处理</th>
+  </tr></thead>
+  <tbody id="requests"></tbody>
+</table>
+
+<h2>操作</h2>
+<div class="card">
+  <strong>修订预算（乐观并发）</strong><br>
+  预算ID <input id="r_id" size="14"> 基线修订 <input id="r_base" size="4">
+  新总量 <input id="r_total" size="7"> 单批上限 <input id="r_cap" size="5">
+  租期(s) <input id="r_lease" size="5"> 理由 <input id="r_reason" size="16">
+  <button onclick="revise()">修订（需服务端已登记负责人）</button>
+  <button onclick="setStatus('pause')">暂停</button>
+  <button onclick="setStatus('resume')">恢复</button>
+</div>
+<div class="card">
+  <strong>人工处理长期悬挂的保留</strong><br>
+  请求号 <input id="h_req" size="18"> 理由 <input id="h_reason" size="30">
+  <button onclick="handle('release')">归还（要求无签名审计）</button>
+  <button onclick="handle('settle-hung')">按已有签名结算</button>
+</div>
+
+<pre id="out"></pre>
+
+<script>
+const $ = id => document.getElementById(id);
+function api(path, opts) {
+  const tok = $("tok").value.trim();
+  return fetch(($("base").value.replace(/\/$/,"")) + path, {
+    method: opts && opts.method || "GET",
+    headers: {"Content-Type":"application/json",
+              ...(tok ? {"Authorization": tok.startsWith("Bearer ")
+                        ? tok : "Bearer " + tok} : {})},
+    body: opts && opts.body ? JSON.stringify(opts.body) : undefined
+  }).then(r => r.json());
+}
+function pill(s){ return `<span class="pill ${s}">${s}</span>`; }
+function fmt(t){ return new Date(t*1000).toISOString().replace("T"," ").slice(0,19); }
+
+async function load() {
+  const s = await api("/api/budgets");
+  if (s.error) { $("out").textContent = JSON.stringify(s,null,2); return; }
+  const st = s.status;
+  $("summary").textContent =
+    `${st.budgets.length} 个预算单 · ${st.reservations.length} 个请求 · ` +
+    `${Object.keys(st.officers).length} 名负责人`;
+  $("budgets").innerHTML = st.budgets.map(b => `
+    <tr>
+      <td><code>${b.budget_id}</code></td>
+      <td>${b.revision}</td><td>${pill(b.status)}</td>
+      <td>${b.purpose}<br><span class="muted">${b.key_version_id.slice(0,18)}<br>${b.subject}</span></td>
+      <td>${b.total}</td>
+      <td class="${b.available===0?'bad':'ok'}">${b.available}</td>
+      <td>${b.reserved}</td><td>${b.consumed}</td>
+      <td>${b.per_batch_cap}</td><td>${b.lease_seconds}</td>
+      <td class="muted">${fmt(b.effective_at)}<br>~ ${fmt(b.deadline)}</td>
+      <td>
+        <button onclick="fillRevise('${b.budget_id}',${b.revision},${b.total},${b.per_batch_cap},${b.lease_seconds})">修订</button>
+        <button onclick="quickStatus('${b.budget_id}','pause')">暂停</button>
+        <button onclick="quickStatus('${b.budget_id}','resume')">恢复</button>
+      </td>
+    </tr>`).join("");
+  $("requests").innerHTML = st.reservations.map(r => `
+    <tr>
+      <td><code>${r.request_id}</code></td>
+      <td class="muted">${r.budget_id.slice(0,14)}</td>
+      <td>${r.subject}</td><td>${pill(r.status)}</td>
+      <td>${r.amount}</td><td>${r.consumed_amount}</td>
+      <td>${r.n_signatures}</td>
+      <td class="muted">${fmt(r.reserved_at)}</td>
+      <td class="muted ${r.lease_expired?'bad':''}">${fmt(r.lease_expires_at)}${r.lease_expired?' (过期)':''}</td>
+      <td>${r.settlement ? `${r.settlement.kind}<br>消费 ${r.settlement.consumed} / 归还 ${r.settlement.released}` : '<span class="muted">—</span>'}</td>
+      <td>${r.manual_handling ? `${r.manual_handling.operator}: ${r.manual_handling.reason}` : '<span class="muted">—</span>'}</td>
+    </tr>`).join("");
+}
+function fillRevise(id,rev,total,cap,lease){
+  $("r_id").value=id; $("r_base").value=rev; $("r_total").value=total;
+  $("r_cap").value=cap; $("r_lease").value=lease;
+}
+async function revise(){
+  const body = {base_revision:+$("r_base").value, total:+$("r_total").value,
+    per_batch_cap:+$("r_cap").value, lease_seconds:+$("r_lease").value,
+    reason:$("r_reason").value};
+  $("out").textContent = JSON.stringify(
+    await api(`/api/budget/budgets/${$("r_id").value}/revise`,
+              {method:"POST", body}), null, 2);
+  load();
+}
+async function setStatus(kind){
+  const id = $("r_id").value, reason = $("r_reason").value;
+  if(!id) return;
+  $("out").textContent = JSON.stringify(
+    await api(`/api/budget/budgets/${id}/${kind}`,
+              {method:"POST", body:{reason}}), null, 2);
+  load();
+}
+async function quickStatus(id, kind){
+  const reason = prompt(kind === "pause" ? "暂停理由" : "恢复理由", "");
+  if(reason === null) return;
+  $("out").textContent = JSON.stringify(
+    await api(`/api/budget/budgets/${id}/${kind}`,
+              {method:"POST", body:{reason}}), null, 2);
+  load();
+}
+async function handle(kind){
+  const body = {request_id:$("h_req").value, reason:$("h_reason").value};
+  const path = kind === "release"
+    ? "/api/budget/reservations/release"
+    : "/api/budget/reservations/settle-hung";
+  $("out").textContent = JSON.stringify(await api(path,{method:"POST",body}),
+    null, 2);
+  load();
+}
+</script>
+</body>
+</html>
